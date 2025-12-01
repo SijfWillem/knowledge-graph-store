@@ -1,0 +1,9 @@
+cognee[neo4j]==0.4.1
+weaviate-client>=4.4.0
+fastapi>=0.115.0
+uvicorn>=0.30.0
+python-multipart>=0.0.9
+python-dotenv>=1.0.1
+aiofiles>=23.2.1
+pydantic>=2.10.0
+networkx>=3.4.2
