@@ -657,33 +657,34 @@ with tab2:
             edges = []
 
             # Color mapping for node types (matching backend entity classification)
+            # Using brighter colors that work well in both light and dark mode
             type_colors = {
                 # Entity types from custom extraction prompt
-                "Person": "#E91E63",           # Pink - People
-                "Organization": "#00BCD4",     # Cyan - Companies, institutions
-                "Location": "#795548",         # Brown - Places
-                "Concept": "#9C27B0",          # Purple - Abstract ideas
-                "Technology": "#3F51B5",       # Indigo - Software, tools
-                "Product": "#FF5722",          # Deep Orange - Products
-                "Event": "#FFC107",            # Amber - Events
-                "Document": "#2196F3",         # Blue - Documents
-                "Date": "#009688",             # Teal - Dates
-                "Metric": "#8BC34A",           # Light Green - Numbers, KPIs
+                "Person": "#FF4081",           # Pink - People (brighter)
+                "Organization": "#00E5FF",     # Cyan - Companies (brighter)
+                "Location": "#A1887F",         # Brown - Places (lighter)
+                "Concept": "#CE93D8",          # Purple - Abstract ideas (lighter)
+                "Technology": "#7C4DFF",       # Indigo - Software (brighter)
+                "Product": "#FF6E40",          # Deep Orange - Products (brighter)
+                "Event": "#FFCA28",            # Amber - Events (brighter)
+                "Document": "#448AFF",         # Blue - Documents (brighter)
+                "Date": "#1DE9B6",             # Teal - Dates (brighter)
+                "Metric": "#B2FF59",           # Light Green - Numbers (brighter)
                 # Default and legacy types
-                "Entity": "#4CAF50",           # Green - Generic entity
-                "Chunk": "#FF9800",            # Orange - Text chunks
-                "default": "#607D8B"           # Gray - Unknown
+                "Entity": "#69F0AE",           # Green - Generic entity (brighter)
+                "Chunk": "#FFB74D",            # Orange - Text chunks (brighter)
+                "default": "#90A4AE"           # Gray - Unknown (lighter)
             }
 
-            # Uniform node size for all nodes
-            NODE_SIZE = 20
+            # Node size - slightly larger for better visibility
+            NODE_SIZE = 25
 
             for node in nodes_data:
                 node_type = node.get("type", "Entity")
                 color = type_colors.get(node_type, type_colors["default"])
                 nodes.append(Node(
                     id=node["id"],
-                    label=node.get("label", node["id"])[:30],
+                    label=node.get("label", node["id"])[:20],
                     size=NODE_SIZE,
                     color=color,
                     title=f"Type: {node_type}\n{str(node.get('data', ''))[:200]}"
@@ -693,45 +694,56 @@ with tab2:
                 edges.append(Edge(
                     source=edge["source"],
                     target=edge["target"],
-                    label=edge.get("label", "")[:20],
-                    color="#888888",
-                    width=1
+                    label=edge.get("label", "")[:12],
+                    color="#999999"
                 ))
 
-            # Graph configuration with uniform styling
+            # Graph configuration with vis.js options via kwargs
             config = Config(
                 width=1200,
-                height=600,
+                height=700,
                 directed=True,
                 physics=True,
                 hierarchical=False,
-                nodeHighlightBehavior=True,
-                highlightColor="#F7A7A6",
-                collapsible=False,
-                node={"labelProperty": "label", "renderLabel": True},
-                link={"labelProperty": "label", "renderLabel": True}
+                # Physics options for better spacing
+                solver="barnesHut",
+                minVelocity=0.75,
+                stabilization=True,
+                fit=True,
+                # Node spacing
+                nodeSpacing=150,
+                # Add edges config for curved edges
+                edges={
+                    "smooth": {
+                        "enabled": True,
+                        "type": "curvedCW",
+                        "roundness": 0.2
+                    },
+                    "arrows": {
+                        "to": {"enabled": True, "scaleFactor": 0.5}
+                    },
+                    "color": "#888888",
+                    "font": {"size": 10, "align": "middle"}
+                }
             )
 
             # Render graph
             return_value = agraph(nodes=nodes, edges=edges, config=config)
 
-            # Legend - display in rows of 4 columns
-            st.markdown("### Legend")
+            # Legend - using Streamlit columns for reliable rendering
+            st.markdown("#### Legend")
             # Filter out 'default' from legend and only show types that might appear
             legend_types = {k: v for k, v in type_colors.items() if k != "default"}
             legend_items = list(legend_types.items())
 
-            # Display in rows of 4
-            cols_per_row = 4
+            # Display in rows of 6 columns
+            cols_per_row = 6
             for row_start in range(0, len(legend_items), cols_per_row):
                 row_items = legend_items[row_start:row_start + cols_per_row]
                 cols = st.columns(cols_per_row)
                 for i, (node_type, color) in enumerate(row_items):
                     with cols[i]:
-                        st.markdown(
-                            f'<span style="color:{color}; font-size: 16px;">●</span> {node_type}',
-                            unsafe_allow_html=True
-                        )
+                        st.markdown(f'<span style="color:{color}; font-size:20px;">●</span> {node_type}', unsafe_allow_html=True)
 
         else:
             st.warning("No graph data available. Upload documents and process them first.")
