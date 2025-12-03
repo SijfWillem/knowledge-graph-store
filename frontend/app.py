@@ -448,7 +448,7 @@ with tab1:
     # Header and options at top
     col1, col2, col3 = st.columns([2, 1, 1])
     with col1:
-        st.header("Chat with your Knowledge Base")
+        st.markdown("### Chat with your Knowledge Base")
     with col2:
         # Check agent status
         agent_status = get_agent_status()
@@ -468,57 +468,59 @@ with tab1:
             disabled=use_agent
         )
 
-    # Display chat messages
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
-            # Show graph context for assistant messages if stored
-            if message["role"] == "assistant":
-                graph_ctx = message.get("graph_context", {})
-                nodes = graph_ctx.get("nodes", [])
-                connections = graph_ctx.get("connections", [])
+    # Chat messages in a scrollable container
+    chat_container = st.container(height=450)
+    with chat_container:
+        for message in st.session_state.messages:
+            with st.chat_message(message["role"]):
+                st.markdown(message["content"])
+                # Show graph context for assistant messages if stored
+                if message["role"] == "assistant":
+                    graph_ctx = message.get("graph_context", {})
+                    nodes = graph_ctx.get("nodes", [])
+                    connections = graph_ctx.get("connections", [])
 
-                if nodes or connections:
-                    with st.expander("🔗 Knowledge Graph Context", expanded=False):
-                        if nodes:
-                            st.markdown("**Retrieved Nodes:**")
-                            for node in nodes:
-                                node_name = node.get("name", "Unknown")
-                                node_type = node.get("type", "Entity")
-                                node_content = node.get("content", "")
-                                st.markdown(f"- **{node_name}** ({node_type})")
-                                if node_content:
-                                    st.markdown(f"  > {node_content[:200]}{'...' if len(node_content) > 200 else ''}")
+                    if nodes or connections:
+                        with st.expander("🔗 Knowledge Graph Context", expanded=False):
+                            if nodes:
+                                st.markdown("**Retrieved Nodes:**")
+                                for node in nodes:
+                                    node_name = node.get("name", "Unknown")
+                                    node_type = node.get("type", "Entity")
+                                    node_content = node.get("content", "")
+                                    st.markdown(f"- **{node_name}** ({node_type})")
+                                    if node_content:
+                                        st.markdown(f"  > {node_content[:200]}{'...' if len(node_content) > 200 else ''}")
 
-                        if connections:
-                            st.markdown("**Relationships:**")
-                            for conn in connections:
-                                src = conn.get("source", "?")
-                                rel = conn.get("relationship", "related_to")
-                                tgt = conn.get("target", "?")
-                                st.markdown(f"- `{src}` → **{rel}** → `{tgt}`")
+                            if connections:
+                                st.markdown("**Relationships:**")
+                                for conn in connections:
+                                    src = conn.get("source", "?")
+                                    rel = conn.get("relationship", "related_to")
+                                    tgt = conn.get("target", "?")
+                                    st.markdown(f"- `{src}` → **{rel}** → `{tgt}`")
 
-                # Show agent steps if available
-                if "agent_steps" in message and message["agent_steps"]:
-                    with st.expander("🤖 Agent Reasoning Steps", expanded=False):
-                        for i, step in enumerate(message["agent_steps"], 1):
-                            st.markdown(f"**Step {i}: {step.get('tool', 'Unknown tool')}**")
-                            if step.get("input"):
-                                st.markdown(f"*Input:* `{step['input']}`")
-                            if step.get("output"):
-                                st.markdown(f"*Output:* {step['output'][:300]}{'...' if len(step.get('output', '')) > 300 else ''}")
-                            st.markdown("---")
+                    # Show agent steps if available
+                    if "agent_steps" in message and message["agent_steps"]:
+                        with st.expander("🤖 Agent Reasoning Steps", expanded=False):
+                            for i, step in enumerate(message["agent_steps"], 1):
+                                st.markdown(f"**Step {i}: {step.get('tool', 'Unknown tool')}**")
+                                if step.get("input"):
+                                    st.markdown(f"*Input:* `{step['input']}`")
+                                if step.get("output"):
+                                    st.markdown(f"*Output:* {step['output'][:300]}{'...' if len(step.get('output', '')) > 300 else ''}")
+                                st.markdown("---")
 
-                # Fallback to legacy retrieved_docs if no graph context
-                elif "retrieved_docs" in message:
-                    docs = message["retrieved_docs"]
-                    if docs:
-                        with st.expander("📄 Retrieved Documents", expanded=False):
-                            for i, doc in enumerate(docs, 1):
-                                st.markdown(f"**Source {i}**")
-                                st.markdown(f"> {doc.get('text', 'No text available')}")
+                    # Fallback to legacy retrieved_docs if no graph context
+                    elif "retrieved_docs" in message:
+                        docs = message["retrieved_docs"]
+                        if docs:
+                            with st.expander("📄 Retrieved Documents", expanded=False):
+                                for i, doc in enumerate(docs, 1):
+                                    st.markdown(f"**Source {i}**")
+                                    st.markdown(f"> {doc.get('text', 'No text available')}")
 
-    # Chat input
+    # Chat input (stays below the scrollable container)
     if prompt := st.chat_input("Ask a question about your documents..."):
         # Add user message
         st.session_state.messages.append({"role": "user", "content": prompt})
