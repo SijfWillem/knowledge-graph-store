@@ -7,3 +7,5 @@ python-dotenv>=1.0.1
 aiofiles>=23.2.1
 pydantic>=2.10.0
 networkx>=3.4.2
+# LangFuse Observability (SDK v2 - required for Cognee 0.4.1 compatibility)
+langfuse>=2.0.0,<3.0.0

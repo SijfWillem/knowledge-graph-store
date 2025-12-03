@@ -25,17 +25,6 @@ st.markdown("""
     .stApp {
         max-width: 100%;
     }
-    .chat-message {
-        padding: 1rem;
-        border-radius: 0.5rem;
-        margin-bottom: 1rem;
-    }
-    .user-message {
-        background-color: #e3f2fd;
-    }
-    .assistant-message {
-        background-color: #f5f5f5;
-    }
     .status-processing {
         color: #ff9800;
     }
@@ -247,21 +236,55 @@ tab1, tab2 = st.tabs(["💬 Chat", "🕸️ Knowledge Graph"])
 
 # Chat tab
 with tab1:
-    st.header("Chat with your Knowledge Base")
-
-    # Search type selector
+    # Header and search type at top
     col1, col2 = st.columns([3, 1])
+    with col1:
+        st.header("Chat with your Knowledge Base")
     with col2:
         search_type = st.selectbox(
             "Search Type",
-            ["GRAPH_COMPLETION", "RAG_COMPLETION", "CHUNKS", "SUMMARIES"],
-            help="GRAPH_COMPLETION: Q&A using knowledge graph\nRAG_COMPLETION: Standard RAG\nCHUNKS: Raw text chunks\nSUMMARIES: Document summaries"
+            ["GRAPH_COMPLETION", "RAG_COMPLETION", "CHUNKS", "CHUNKS_LEXICAL", "SUMMARIES", "CODE", "GRAPH_COMPLETION_COT"],
+            help="GRAPH_COMPLETION: Q&A using knowledge graph (default)\nRAG_COMPLETION: Standard RAG\nCHUNKS: Raw text chunks\nCHUNKS_LEXICAL: Token-based lexical search\nSUMMARIES: Document summaries\nCODE: Code-specific search\nGRAPH_COMPLETION_COT: Chain-of-thought reasoning"
         )
 
     # Display chat messages
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
+            # Show graph context for assistant messages if stored
+            if message["role"] == "assistant":
+                graph_ctx = message.get("graph_context", {})
+                nodes = graph_ctx.get("nodes", [])
+                connections = graph_ctx.get("connections", [])
+
+                if nodes or connections:
+                    with st.expander("🔗 Knowledge Graph Context", expanded=False):
+                        if nodes:
+                            st.markdown("**Retrieved Nodes:**")
+                            for node in nodes:
+                                node_name = node.get("name", "Unknown")
+                                node_type = node.get("type", "Entity")
+                                node_content = node.get("content", "")
+                                st.markdown(f"- **{node_name}** ({node_type})")
+                                if node_content:
+                                    st.markdown(f"  > {node_content[:200]}{'...' if len(node_content) > 200 else ''}")
+
+                        if connections:
+                            st.markdown("**Relationships:**")
+                            for conn in connections:
+                                src = conn.get("source", "?")
+                                rel = conn.get("relationship", "related_to")
+                                tgt = conn.get("target", "?")
+                                st.markdown(f"- `{src}` → **{rel}** → `{tgt}`")
+
+                # Fallback to legacy retrieved_docs if no graph context
+                elif "retrieved_docs" in message:
+                    docs = message["retrieved_docs"]
+                    if docs:
+                        with st.expander("📄 Retrieved Documents", expanded=False):
+                            for i, doc in enumerate(docs, 1):
+                                st.markdown(f"**Source {i}**")
+                                st.markdown(f"> {doc.get('text', 'No text available')}")
 
     # Chat input
     if prompt := st.chat_input("Ask a question about your documents..."):
@@ -277,21 +300,57 @@ with tab1:
 
                 if "error" in result:
                     response = f"Error: {result['error']}"
+                    graph_context = {}
+                    retrieved_docs = []
                 elif "answer" in result:
-                    # Display the GraphRAG answer
                     response = result["answer"]
-
-                    # Show graph relationships as sources
-                    sources = result.get("sources", [])
-                    if sources:
-                        response += "\n\n---\n**Knowledge Graph Sources:**\n"
-                        for src in sources[:5]:
-                            response += f"- `{src}`\n"
+                    graph_context = result.get("graph_context", {})
+                    retrieved_docs = result.get("retrieved_documents", [])
                 else:
                     response = "No answer could be generated. Try adding more documents."
+                    graph_context = {}
+                    retrieved_docs = []
 
                 st.markdown(response)
-                st.session_state.messages.append({"role": "assistant", "content": response})
+
+                # Show graph context (nodes and connections)
+                nodes = graph_context.get("nodes", [])
+                connections = graph_context.get("connections", [])
+
+                if nodes or connections:
+                    with st.expander("🔗 Knowledge Graph Context", expanded=True):
+                        if nodes:
+                            st.markdown("**Retrieved Nodes:**")
+                            for node in nodes:
+                                node_name = node.get("name", "Unknown")
+                                node_type = node.get("type", "Entity")
+                                node_content = node.get("content", "")
+                                st.markdown(f"- **{node_name}** ({node_type})")
+                                if node_content:
+                                    st.markdown(f"  > {node_content[:200]}{'...' if len(node_content) > 200 else ''}")
+
+                        if connections:
+                            st.markdown("**Relationships:**")
+                            for conn in connections:
+                                src = conn.get("source", "?")
+                                rel = conn.get("relationship", "related_to")
+                                tgt = conn.get("target", "?")
+                                st.markdown(f"- `{src}` → **{rel}** → `{tgt}`")
+
+                # Fallback to legacy retrieved_docs if no graph context
+                elif retrieved_docs:
+                    with st.expander("📄 Retrieved Documents", expanded=False):
+                        for i, doc in enumerate(retrieved_docs, 1):
+                            st.markdown(f"**Source {i}**")
+                            st.markdown(f"> {doc.get('text', 'No text available')}")
+
+                # Store message with graph context
+                st.session_state.messages.append({
+                    "role": "assistant",
+                    "content": response,
+                    "graph_context": graph_context,
+                    "retrieved_docs": retrieved_docs
+                })
 
 # Graph visualization tab
 with tab2:
@@ -333,13 +392,16 @@ with tab2:
                 "default": "#607D8B"
             }
 
+            # Uniform node size for all nodes
+            NODE_SIZE = 20
+
             for node in nodes_data:
                 node_type = node.get("type", "Entity")
                 color = type_colors.get(node_type, type_colors["default"])
                 nodes.append(Node(
                     id=node["id"],
                     label=node.get("label", node["id"])[:30],
-                    size=25,
+                    size=NODE_SIZE,
                     color=color,
                     title=f"Type: {node_type}\n{str(node.get('data', ''))[:200]}"
                 ))
@@ -349,10 +411,11 @@ with tab2:
                     source=edge["source"],
                     target=edge["target"],
                     label=edge.get("label", "")[:20],
-                    color="#888888"
+                    color="#888888",
+                    width=1
                 ))
 
-            # Graph configuration
+            # Graph configuration with uniform styling
             config = Config(
                 width=1200,
                 height=600,
@@ -362,7 +425,7 @@ with tab2:
                 nodeHighlightBehavior=True,
                 highlightColor="#F7A7A6",
                 collapsible=False,
-                node={"labelProperty": "label"},
+                node={"labelProperty": "label", "renderLabel": True},
                 link={"labelProperty": "label", "renderLabel": True}
             )
 

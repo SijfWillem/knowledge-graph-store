@@ -1,4 +1,4 @@
-.PHONY: help build up down restart logs clean setup dev-backend dev-frontend test status neo4j-shell start wipe
+.PHONY: help build up down restart logs clean setup dev-backend dev-frontend test status neo4j-shell start wipe langfuse langfuse-logs langfuse-setup
 
 # Default target
 help:
@@ -7,7 +7,7 @@ help:
 	@echo ""
 	@echo "Quick Start:"
 	@echo "  make start          - Build and start everything"
-	@echo "  make wipe           - Delete ALL data (Neo4j, uploads, Cognee)"
+	@echo "  make wipe           - Delete ALL data (Neo4j, LangFuse, uploads, Cognee)"
 	@echo ""
 	@echo "Setup:"
 	@echo "  make setup          - Create .env file from template"
@@ -19,6 +19,11 @@ help:
 	@echo "  make restart        - Restart all services"
 	@echo "  make logs           - View logs from all services"
 	@echo "  make status         - Show status of all services"
+	@echo ""
+	@echo "LangFuse Observability (Self-Hosted):"
+	@echo "  make langfuse       - Open LangFuse UI (http://localhost:3000)"
+	@echo "  make langfuse-logs  - View LangFuse service logs"
+	@echo "  make langfuse-setup - Instructions for configuring LangFuse API keys"
 	@echo ""
 	@echo "Development:"
 	@echo "  make dev-backend    - Run backend locally (without Docker)"
@@ -38,6 +43,12 @@ setup:
 	@if [ ! -f .env ]; then \
 		cp .env.example .env; \
 		echo "Created .env file. Please edit it with your API keys."; \
+		echo ""; \
+		echo "Required:"; \
+		echo "  - OPENAI_API_KEY: Your OpenAI API key"; \
+		echo ""; \
+		echo "After first start, configure LangFuse:"; \
+		echo "  - Run 'make langfuse-setup' for instructions"; \
 	else \
 		echo ".env file already exists."; \
 	fi
@@ -55,12 +66,14 @@ up:
 	docker-compose up -d
 	@echo ""
 	@echo "Services starting..."
-	@echo "  - Frontend: http://localhost:8501"
+	@echo "  - Frontend:    http://localhost:8501"
 	@echo "  - Backend API: http://localhost:8000"
-	@echo "  - Neo4j Browser: http://localhost:7475"
-	@echo "  - Weaviate: http://localhost:8081"
+	@echo "  - Neo4j:       http://localhost:7475"
+	@echo "  - Weaviate:    http://localhost:8081"
+	@echo "  - LangFuse:    http://localhost:3000 (self-hosted)"
 	@echo ""
 	@echo "Run 'make logs' to view logs"
+	@echo "Run 'make langfuse-setup' for LangFuse configuration"
 
 # Stop all services
 down:
@@ -86,14 +99,55 @@ logs-neo4j:
 logs-weaviate:
 	docker-compose logs -f weaviate
 
+# LangFuse logs
+langfuse-logs:
+	docker-compose logs -f langfuse-web langfuse-worker
+
 # Show service status
 status:
 	docker-compose ps
 
+# Open LangFuse UI
+langfuse:
+	@echo "Opening LangFuse UI at http://localhost:3000"
+	@echo ""
+	@echo "This is your SELF-HOSTED LangFuse instance."
+	@echo "No data is sent to LangFuse cloud."
+	@echo ""
+	@open http://localhost:3000 2>/dev/null || xdg-open http://localhost:3000 2>/dev/null || echo "Please open http://localhost:3000 in your browser"
+
+# LangFuse setup instructions
+langfuse-setup:
+	@echo ""
+	@echo "============================================"
+	@echo "  LangFuse Setup (Self-Hosted)"
+	@echo "============================================"
+	@echo ""
+	@echo "LangFuse is running LOCALLY at http://localhost:3000"
+	@echo "No data is sent to LangFuse cloud."
+	@echo ""
+	@echo "First-time setup:"
+	@echo ""
+	@echo "  1. Open http://localhost:3000"
+	@echo "  2. Create an account (stored locally)"
+	@echo "  3. Create a new project"
+	@echo "  4. Go to Settings > API Keys"
+	@echo "  5. Click 'Create new API key'"
+	@echo "  6. Copy the keys to your .env file:"
+	@echo ""
+	@echo "     LANGFUSE_PUBLIC_KEY=pk-lf-..."
+	@echo "     LANGFUSE_SECRET_KEY=sk-lf-..."
+	@echo ""
+	@echo "  7. Restart the backend:"
+	@echo "     make restart"
+	@echo ""
+	@echo "============================================"
+
 # Local development - backend only
 dev-backend:
 	@echo "Starting backend locally..."
-	@echo "Make sure Neo4j and Weaviate are running (docker-compose up neo4j weaviate)"
+	@echo "Make sure Neo4j, Weaviate, and LangFuse are running:"
+	@echo "  docker-compose up -d neo4j weaviate langfuse-postgres langfuse-clickhouse langfuse-redis langfuse-minio langfuse-worker langfuse-web"
 	cd backend && pip install -r requirements.txt && uvicorn main:app --reload --host 0.0.0.0 --port 8000
 
 # Local development - frontend only
@@ -104,10 +158,11 @@ dev-frontend:
 
 # Start just the databases (for local development)
 dev-db:
-	docker-compose up -d neo4j weaviate
-	@echo "Neo4j and Weaviate started."
+	docker-compose up -d neo4j weaviate langfuse-postgres langfuse-clickhouse langfuse-redis langfuse-minio langfuse-worker langfuse-web
+	@echo "Databases and LangFuse started."
 	@echo "  - Neo4j Browser: http://localhost:7475 (neo4j/cogneepassword)"
 	@echo "  - Weaviate: http://localhost:8081"
+	@echo "  - LangFuse: http://localhost:3000 (self-hosted)"
 
 # Local development - both services
 dev: dev-db
@@ -153,9 +208,18 @@ test:
 # Health check
 health:
 	@echo "Checking service health..."
-	@curl -s http://localhost:8000/health | python3 -m json.tool || echo "Backend not responding"
-	@curl -s http://localhost:8081/v1/.well-known/ready | python3 -m json.tool || echo "Weaviate not responding"
-	@curl -s http://localhost:7475 > /dev/null && echo "Neo4j: OK" || echo "Neo4j not responding"
+	@echo ""
+	@echo "Backend:"
+	@curl -s http://localhost:8000/health | python3 -m json.tool || echo "  Backend not responding"
+	@echo ""
+	@echo "Weaviate:"
+	@curl -s http://localhost:8081/v1/.well-known/ready | python3 -m json.tool || echo "  Weaviate not responding"
+	@echo ""
+	@echo "Neo4j:"
+	@curl -s http://localhost:7475 > /dev/null && echo "  OK" || echo "  Neo4j not responding"
+	@echo ""
+	@echo "LangFuse (self-hosted):"
+	@curl -s http://localhost:3000/api/public/health > /dev/null && echo "  OK" || echo "  LangFuse not responding"
 
 # Start everything (setup + build + up)
 start:
@@ -176,6 +240,10 @@ start:
 	@echo "  Frontend:    http://localhost:8501"
 	@echo "  Backend API: http://localhost:8000"
 	@echo "  Neo4j:       http://localhost:7475"
+	@echo "  LangFuse:    http://localhost:3000 (self-hosted)"
+	@echo ""
+	@echo "  LangFuse is running LOCALLY - no cloud dependency!"
+	@echo "  Run 'make langfuse-setup' to configure API keys"
 	@echo ""
 	@echo "  Run 'make logs' to view logs"
 	@echo "============================================"
@@ -194,6 +262,7 @@ wipe:
 	@echo ""
 	@echo "  - Neo4j database: cleared"
 	@echo "  - Cognee data: cleared"
+	@echo "  - LangFuse data: cleared"
 	@echo "  - Uploaded files: cleared"
 	@echo ""
 	@echo "  Run 'make start' to start fresh"
