@@ -106,6 +106,28 @@ def query_knowledge(query, search_type):
         return {"error": str(e)}
 
 
+def query_agent(query):
+    """Query the knowledge base using the LangChain agent."""
+    try:
+        response = requests.post(
+            f"{BACKEND_URL}/agent/query",
+            json={"query": query, "use_agent": True},
+            timeout=120
+        )
+        return response.json()
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def get_agent_status():
+    """Check if the LangChain agent is available."""
+    try:
+        response = requests.get(f"{BACKEND_URL}/agent/status", timeout=5)
+        return response.json()
+    except:
+        return {"langchain_enabled": False, "agent_available": False}
+
+
 def get_graph_data():
     """Get knowledge graph data."""
     try:
@@ -116,12 +138,30 @@ def get_graph_data():
 
 
 def reset_knowledge_base():
-    """Reset the knowledge base."""
+    """Reset the knowledge base with comprehensive cleanup.
+
+    Returns a response with step-by-step progress:
+    - Neo4j graph clearing
+    - Uploaded files clearing
+    - Cognee data clearing
+    """
     try:
-        response = requests.delete(f"{BACKEND_URL}/reset", timeout=30)
+        response = requests.delete(f"{BACKEND_URL}/reset", timeout=60)
         return response.json()
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": str(e), "success": False, "steps": []}
+
+
+def reset_langfuse_traces():
+    """Reset LangFuse traces while preserving project and API keys.
+
+    Returns a response with step-by-step progress for each ClickHouse table.
+    """
+    try:
+        response = requests.delete(f"{BACKEND_URL}/reset-langfuse-traces", timeout=120)
+        return response.json()
+    except Exception as e:
+        return {"error": str(e), "success": False, "steps": []}
 
 
 # Initialize session state
@@ -218,16 +258,185 @@ with st.sidebar:
 
     st.markdown("---")
 
-    # Reset button
-    if st.button("🗑️ Reset Knowledge Base", type="secondary"):
-        if st.checkbox("Confirm reset"):
-            result = reset_knowledge_base()
-            if "error" in result:
-                st.error(f"Error: {result['error']}")
-            else:
-                st.success("Knowledge base reset!")
-                st.session_state.messages = []
-                st.session_state.graph_data = None
+    # Reset button with progress display
+    st.subheader("🗑️ Reset Knowledge Base")
+    st.caption("Clears Neo4j graph, uploaded files, and Cognee data")
+
+    if "reset_confirmed" not in st.session_state:
+        st.session_state.reset_confirmed = False
+
+    if st.button("Reset Knowledge Base", type="secondary"):
+        st.session_state.reset_confirmed = True
+
+    if st.session_state.reset_confirmed:
+        confirm = st.checkbox("I understand this will delete all data", value=False)
+
+        if confirm:
+            if st.button("Confirm Reset", type="primary"):
+                # Create progress display
+                progress_container = st.container()
+
+                with progress_container:
+                    st.markdown("**Resetting Knowledge Base...**")
+
+                    # Show initial progress
+                    step_status = st.empty()
+                    step_status.info("⏳ Starting reset...")
+
+                    # Progress bar
+                    progress_bar = st.progress(0)
+
+                    # Step indicators
+                    neo4j_status = st.empty()
+                    uploads_status = st.empty()
+                    cognee_status = st.empty()
+
+                    neo4j_status.markdown("⏳ Neo4j graph...")
+                    uploads_status.markdown("⏳ Uploaded files...")
+                    cognee_status.markdown("⏳ Cognee data...")
+
+                    progress_bar.progress(10)
+
+                    # Call reset endpoint
+                    result = reset_knowledge_base()
+
+                    if "error" in result and not result.get("steps"):
+                        step_status.error(f"❌ Error: {result['error']}")
+                    else:
+                        # Update progress based on steps
+                        steps = result.get("steps", [])
+                        progress_bar.progress(30)
+
+                        for step in steps:
+                            step_name = step.get("step", "")
+                            status = step.get("status", "")
+                            message = step.get("message", "")
+
+                            if step_name == "neo4j":
+                                progress_bar.progress(50)
+                                if status == "success":
+                                    neo4j_status.markdown(f"✅ {message}")
+                                else:
+                                    neo4j_status.markdown(f"❌ {message}")
+
+                            elif step_name == "uploads":
+                                progress_bar.progress(70)
+                                if status == "success":
+                                    uploads_status.markdown(f"✅ {message}")
+                                else:
+                                    uploads_status.markdown(f"❌ {message}")
+
+                            elif step_name == "cognee":
+                                progress_bar.progress(90)
+                                if status == "success":
+                                    cognee_status.markdown(f"✅ {message}")
+                                else:
+                                    cognee_status.markdown(f"❌ {message}")
+
+                        progress_bar.progress(100)
+
+                        # Final status
+                        if result.get("success", False):
+                            step_status.success("✅ Knowledge base reset successfully!")
+                            # Clear session state
+                            st.session_state.messages = []
+                            st.session_state.graph_data = None
+                            st.session_state.reset_confirmed = False
+                        else:
+                            step_status.warning(f"⚠️ {result.get('message', 'Reset completed with some issues')}")
+
+                        # Add rerun button
+                        if st.button("Done"):
+                            st.session_state.reset_confirmed = False
+                            st.rerun()
+        else:
+            if st.button("Cancel"):
+                st.session_state.reset_confirmed = False
+                st.rerun()
+
+    st.markdown("---")
+
+    # LangFuse Traces Reset button with progress display
+    st.subheader("📊 Reset LangFuse Traces")
+    st.caption("Clears all traces, keeps project & API keys")
+
+    if "langfuse_reset_confirmed" not in st.session_state:
+        st.session_state.langfuse_reset_confirmed = False
+
+    if st.button("Reset LangFuse Traces", type="secondary"):
+        st.session_state.langfuse_reset_confirmed = True
+
+    if st.session_state.langfuse_reset_confirmed:
+        lf_confirm = st.checkbox("I understand this will delete all traces", value=False, key="lf_confirm")
+
+        if lf_confirm:
+            if st.button("Confirm LangFuse Reset", type="primary", key="lf_reset_btn"):
+                # Create progress display
+                lf_progress_container = st.container()
+
+                with lf_progress_container:
+                    st.markdown("**Clearing LangFuse Traces...**")
+
+                    # Show initial progress
+                    lf_step_status = st.empty()
+                    lf_step_status.info("⏳ Connecting to ClickHouse...")
+
+                    # Progress bar
+                    lf_progress_bar = st.progress(0)
+
+                    # Step indicators for each table
+                    table_statuses = {}
+                    tables = ["traces", "observations", "scores", "event_log"]
+
+                    for table in tables:
+                        table_statuses[table] = st.empty()
+                        table_statuses[table].markdown(f"⏳ {table}...")
+
+                    lf_progress_bar.progress(10)
+
+                    # Call reset endpoint
+                    result = reset_langfuse_traces()
+
+                    if "error" in result and not result.get("steps"):
+                        lf_step_status.error(f"❌ Error: {result['error']}")
+                    else:
+                        # Update progress based on steps
+                        steps = result.get("steps", [])
+                        total_steps = len(tables)
+
+                        for i, step in enumerate(steps):
+                            step_name = step.get("step", "")
+                            status = step.get("status", "")
+                            message = step.get("message", "")
+
+                            # Update progress bar
+                            progress = int(10 + (90 * (i + 1) / total_steps))
+                            lf_progress_bar.progress(progress)
+
+                            # Update step status
+                            if step_name in table_statuses:
+                                if status == "success":
+                                    table_statuses[step_name].markdown(f"✅ {message}")
+                                else:
+                                    table_statuses[step_name].markdown(f"❌ {message}")
+
+                        lf_progress_bar.progress(100)
+
+                        # Final status
+                        if result.get("success", False):
+                            lf_step_status.success("✅ LangFuse traces cleared successfully!")
+                            st.info(result.get("note", "Refresh LangFuse UI to see changes."))
+                            st.session_state.langfuse_reset_confirmed = False
+                        else:
+                            lf_step_status.warning(f"⚠️ {result.get('message', 'Completed with some issues')}")
+
+                        # Add rerun button
+                        if st.button("Done", key="lf_done_btn"):
+                            st.session_state.langfuse_reset_confirmed = False
+                            st.rerun()
+        else:
+            if st.button("Cancel", key="lf_cancel_btn"):
+                st.session_state.langfuse_reset_confirmed = False
                 st.rerun()
 
 
@@ -236,15 +445,27 @@ tab1, tab2 = st.tabs(["💬 Chat", "🕸️ Knowledge Graph"])
 
 # Chat tab
 with tab1:
-    # Header and search type at top
-    col1, col2 = st.columns([3, 1])
+    # Header and options at top
+    col1, col2, col3 = st.columns([2, 1, 1])
     with col1:
         st.header("Chat with your Knowledge Base")
     with col2:
+        # Check agent status
+        agent_status = get_agent_status()
+        use_agent = st.toggle(
+            "Use Agent",
+            value=False,
+            help="Use LangChain agent for multi-step reasoning",
+            disabled=not agent_status.get("agent_available", False)
+        )
+        if not agent_status.get("agent_available", False):
+            st.caption("Agent unavailable")
+    with col3:
         search_type = st.selectbox(
             "Search Type",
-            ["GRAPH_COMPLETION", "RAG_COMPLETION", "CHUNKS", "CHUNKS_LEXICAL", "SUMMARIES", "CODE", "GRAPH_COMPLETION_COT"],
-            help="GRAPH_COMPLETION: Q&A using knowledge graph (default)\nRAG_COMPLETION: Standard RAG\nCHUNKS: Raw text chunks\nCHUNKS_LEXICAL: Token-based lexical search\nSUMMARIES: Document summaries\nCODE: Code-specific search\nGRAPH_COMPLETION_COT: Chain-of-thought reasoning"
+            ["GRAPH_COMPLETION", "CHUNKS", "CHUNKS_LEXICAL", "SUMMARIES", "CODE", "GRAPH_COMPLETION_COT"],
+            help="GRAPH_COMPLETION: Q&A using knowledge graph (default)\nCHUNKS: Raw text chunks\nCHUNKS_LEXICAL: Token-based lexical search\nSUMMARIES: Document summaries\nCODE: Code-specific search\nGRAPH_COMPLETION_COT: Chain-of-thought reasoning",
+            disabled=use_agent
         )
 
     # Display chat messages
@@ -277,6 +498,17 @@ with tab1:
                                 tgt = conn.get("target", "?")
                                 st.markdown(f"- `{src}` → **{rel}** → `{tgt}`")
 
+                # Show agent steps if available
+                if "agent_steps" in message and message["agent_steps"]:
+                    with st.expander("🤖 Agent Reasoning Steps", expanded=False):
+                        for i, step in enumerate(message["agent_steps"], 1):
+                            st.markdown(f"**Step {i}: {step.get('tool', 'Unknown tool')}**")
+                            if step.get("input"):
+                                st.markdown(f"*Input:* `{step['input']}`")
+                            if step.get("output"):
+                                st.markdown(f"*Output:* {step['output'][:300]}{'...' if len(step.get('output', '')) > 300 else ''}")
+                            st.markdown("---")
+
                 # Fallback to legacy retrieved_docs if no graph context
                 elif "retrieved_docs" in message:
                     docs = message["retrieved_docs"]
@@ -295,62 +527,106 @@ with tab1:
 
         # Get response
         with st.chat_message("assistant"):
-            with st.spinner("Querying knowledge graph..."):
-                result = query_knowledge(prompt, search_type)
+            if use_agent:
+                # Use LangChain agent
+                with st.spinner("Agent is reasoning..."):
+                    result = query_agent(prompt)
 
-                if "error" in result:
-                    response = f"Error: {result['error']}"
-                    graph_context = {}
-                    retrieved_docs = []
-                elif "answer" in result:
-                    response = result["answer"]
-                    graph_context = result.get("graph_context", {})
-                    retrieved_docs = result.get("retrieved_documents", [])
-                else:
-                    response = "No answer could be generated. Try adding more documents."
-                    graph_context = {}
-                    retrieved_docs = []
+                    if "error" in result:
+                        response = f"Error: {result['error']}"
+                        graph_context = {}
+                        agent_steps = []
+                        retrieved_docs = []
+                    elif "answer" in result:
+                        response = result["answer"]
+                        graph_context = {}
+                        agent_steps = result.get("steps", [])
+                        retrieved_docs = []
+                    else:
+                        response = "No answer could be generated. Try adding more documents."
+                        graph_context = {}
+                        agent_steps = []
+                        retrieved_docs = []
 
-                st.markdown(response)
+                    st.markdown(response)
 
-                # Show graph context (nodes and connections)
-                nodes = graph_context.get("nodes", [])
-                connections = graph_context.get("connections", [])
+                    # Show agent steps
+                    if agent_steps:
+                        with st.expander("🤖 Agent Reasoning Steps", expanded=True):
+                            for i, step in enumerate(agent_steps, 1):
+                                st.markdown(f"**Step {i}: {step.get('tool', 'Unknown tool')}**")
+                                if step.get("input"):
+                                    st.markdown(f"*Input:* `{step['input']}`")
+                                if step.get("output"):
+                                    st.markdown(f"*Output:* {step['output'][:300]}{'...' if len(step.get('output', '')) > 300 else ''}")
+                                st.markdown("---")
 
-                if nodes or connections:
-                    with st.expander("🔗 Knowledge Graph Context", expanded=True):
-                        if nodes:
-                            st.markdown("**Retrieved Nodes:**")
-                            for node in nodes:
-                                node_name = node.get("name", "Unknown")
-                                node_type = node.get("type", "Entity")
-                                node_content = node.get("content", "")
-                                st.markdown(f"- **{node_name}** ({node_type})")
-                                if node_content:
-                                    st.markdown(f"  > {node_content[:200]}{'...' if len(node_content) > 200 else ''}")
+                    # Store message with agent steps
+                    st.session_state.messages.append({
+                        "role": "assistant",
+                        "content": response,
+                        "agent_steps": agent_steps,
+                        "graph_context": {},
+                        "retrieved_docs": []
+                    })
+            else:
+                # Use direct query
+                with st.spinner("Querying knowledge graph..."):
+                    result = query_knowledge(prompt, search_type)
 
-                        if connections:
-                            st.markdown("**Relationships:**")
-                            for conn in connections:
-                                src = conn.get("source", "?")
-                                rel = conn.get("relationship", "related_to")
-                                tgt = conn.get("target", "?")
-                                st.markdown(f"- `{src}` → **{rel}** → `{tgt}`")
+                    if "error" in result:
+                        response = f"Error: {result['error']}"
+                        graph_context = {}
+                        retrieved_docs = []
+                    elif "answer" in result:
+                        response = result["answer"]
+                        graph_context = result.get("graph_context", {})
+                        retrieved_docs = result.get("retrieved_documents", [])
+                    else:
+                        response = "No answer could be generated. Try adding more documents."
+                        graph_context = {}
+                        retrieved_docs = []
 
-                # Fallback to legacy retrieved_docs if no graph context
-                elif retrieved_docs:
-                    with st.expander("📄 Retrieved Documents", expanded=False):
-                        for i, doc in enumerate(retrieved_docs, 1):
-                            st.markdown(f"**Source {i}**")
-                            st.markdown(f"> {doc.get('text', 'No text available')}")
+                    st.markdown(response)
 
-                # Store message with graph context
-                st.session_state.messages.append({
-                    "role": "assistant",
-                    "content": response,
-                    "graph_context": graph_context,
-                    "retrieved_docs": retrieved_docs
-                })
+                    # Show graph context (nodes and connections)
+                    nodes = graph_context.get("nodes", [])
+                    connections = graph_context.get("connections", [])
+
+                    if nodes or connections:
+                        with st.expander("🔗 Knowledge Graph Context", expanded=True):
+                            if nodes:
+                                st.markdown("**Retrieved Nodes:**")
+                                for node in nodes:
+                                    node_name = node.get("name", "Unknown")
+                                    node_type = node.get("type", "Entity")
+                                    node_content = node.get("content", "")
+                                    st.markdown(f"- **{node_name}** ({node_type})")
+                                    if node_content:
+                                        st.markdown(f"  > {node_content[:200]}{'...' if len(node_content) > 200 else ''}")
+
+                            if connections:
+                                st.markdown("**Relationships:**")
+                                for conn in connections:
+                                    src = conn.get("source", "?")
+                                    rel = conn.get("relationship", "related_to")
+                                    tgt = conn.get("target", "?")
+                                    st.markdown(f"- `{src}` → **{rel}** → `{tgt}`")
+
+                    # Fallback to legacy retrieved_docs if no graph context
+                    elif retrieved_docs:
+                        with st.expander("📄 Retrieved Documents", expanded=False):
+                            for i, doc in enumerate(retrieved_docs, 1):
+                                st.markdown(f"**Source {i}**")
+                                st.markdown(f"> {doc.get('text', 'No text available')}")
+
+                    # Store message with graph context
+                    st.session_state.messages.append({
+                        "role": "assistant",
+                        "content": response,
+                        "graph_context": graph_context,
+                        "retrieved_docs": retrieved_docs
+                    })
 
 # Graph visualization tab
 with tab2:

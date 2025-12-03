@@ -179,6 +179,7 @@ services:
     ports:
       - "8000:8000"
     environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
       - LLM_API_KEY=${OPENAI_API_KEY}
       - GRAPH_DATABASE_PROVIDER=neo4j
       - GRAPH_DATABASE_URL=bolt://neo4j:7687
@@ -186,7 +187,10 @@ services:
       - GRAPH_DATABASE_PASSWORD=cogneepassword
       - VECTOR_DB_PROVIDER=lancedb
       # LangFuse Observability (self-hosted)
-      - MONITORING_TOOL=${MONITORING_TOOL:-}
+      # NOTE: Set MONITORING_TOOL=none for Cognee (uses SDK v2 which is incompatible)
+      # Our main.py handles LangFuse tracing via SDK v3 directly
+      - MONITORING_TOOL=none
+      - LANGFUSE_ENABLED=${LANGFUSE_ENABLED:-true}
       - LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY:-}
       - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY:-}
       - LANGFUSE_HOST=http://langfuse-web:3000

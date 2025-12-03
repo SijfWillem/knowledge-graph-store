@@ -1,23 +1,65 @@
 """
-Cognee RAG Backend API
-Provides endpoints for document upload, knowledge graph building, and RAG queries.
-Includes LangFuse observability for tracing LLM calls.
+Cognee Knowledge Graph Backend API
+Provides endpoints for document upload, knowledge graph building, and intelligent queries.
+Includes LangChain agent orchestration and LangFuse observability for tracing.
 """
 import os
 import asyncio
 import json
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List, Any
 from contextlib import asynccontextmanager
 
+# Apply nest_asyncio to allow nested event loops
+# This is required because LangChain tools run in thread pool executors
+# but need to call async Cognee/Neo4j functions that are tied to the main event loop
+import nest_asyncio
+nest_asyncio.apply()
+print("✓ nest_asyncio applied for nested event loop support")
+
+# Configure Cognee data directories BEFORE importing cognee
+# This ensures the database is created in the mounted volume
+COGNEE_DATA_DIR = Path("/root/.cognee_system")
+COGNEE_DATA_DIR.mkdir(parents=True, exist_ok=True)
+(COGNEE_DATA_DIR / "databases").mkdir(exist_ok=True)
+
+# Patch Cognee's observability to work with LangFuse SDK v3
+# Cognee 0.4.1 uses SDK v2 API (langfuse.decorators) which doesn't exist in v3
+# We create a compatibility shim before importing cognee
+import sys
+from types import ModuleType
+
+# Create the langfuse.decorators module shim for Cognee compatibility
+if 'langfuse.decorators' not in sys.modules:
+    # Create a no-op observe decorator that matches Cognee's expected interface
+    def _cognee_observe(*args, **kwargs):
+        """Compatibility shim for Cognee's langfuse.decorators.observe"""
+        if len(args) == 1 and callable(args[0]) and not kwargs:
+            return args[0]
+        def decorator(func):
+            return func
+        return decorator
+
+    # Create the fake module
+    decorators_module = ModuleType('langfuse.decorators')
+    decorators_module.observe = _cognee_observe
+
+    # Register it so imports find it
+    sys.modules['langfuse.decorators'] = decorators_module
+    print("✓ Created langfuse.decorators compatibility shim for Cognee")
+
 import cognee
+
+# Now configure cognee to use our data directory
+cognee.config.system_root_directory(str(COGNEE_DATA_DIR))
+print(f"✓ Cognee system directory set to: {COGNEE_DATA_DIR}")
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import aiofiles
 
-# LangFuse Observability - SDK v2 (compatible with Cognee 0.4.1)
+# LangFuse Observability - SDK v3
 # No-op decorator by default - works without any dependencies
 def _noop_observe(*args, **kwargs):
     """No-op decorator when observability is disabled or unavailable."""
@@ -25,44 +67,49 @@ def _noop_observe(*args, **kwargs):
         return func
     return decorator if not args else args[0]
 
-def _noop_flush():
-    """No-op flush when observability is disabled."""
-    pass
-
-class _NoopContext:
-    """No-op context manager when observability is disabled."""
+class _NoopClient:
+    """No-op client when observability is disabled."""
     @staticmethod
-    def update_current_observation(**kwargs):
+    def update_current_span(**kwargs):
+        pass
+    @staticmethod
+    def update_current_generation(**kwargs):
         pass
     @staticmethod
     def update_current_trace(**kwargs):
         pass
     @staticmethod
+    def get_current_trace_id():
+        return None
+    @staticmethod
+    def get_current_observation_id():
+        return None
+    @staticmethod
     def flush():
         pass
 
 observe = _noop_observe
-langfuse_flush = _noop_flush
-langfuse_ctx = _NoopContext()
+langfuse_client = _NoopClient()
 OBSERVABILITY_ENABLED = False
 
 # Only attempt to import langfuse if explicitly enabled AND keys are set
-if os.environ.get("MONITORING_TOOL") == "langfuse":
+# Note: We use LANGFUSE_ENABLED instead of MONITORING_TOOL because Cognee uses
+# MONITORING_TOOL internally with SDK v2, while we use SDK v3 directly
+_langfuse_enabled = os.environ.get("LANGFUSE_ENABLED", "").lower() in ("true", "1", "yes")
+if _langfuse_enabled:
     _secret_key = os.environ.get("LANGFUSE_SECRET_KEY", "")
     _public_key = os.environ.get("LANGFUSE_PUBLIC_KEY", "")
     _host = os.environ.get("LANGFUSE_HOST", "")
 
     if _secret_key and _public_key and not _secret_key.startswith("sk-lf-your"):
         try:
-            # LangFuse SDK v2 import path (required for Cognee 0.4.1)
-            from langfuse.decorators import observe as langfuse_observe, langfuse_context
+            # LangFuse SDK v3 import path
+            from langfuse import observe as langfuse_observe, get_client
 
             observe = langfuse_observe
-            # Use langfuse_context.flush() for decorator-based tracing
-            langfuse_flush = langfuse_context.flush
-            langfuse_ctx = langfuse_context
+            langfuse_client = get_client()
             OBSERVABILITY_ENABLED = True
-            print(f"✓ LangFuse observability enabled (SDK v2)")
+            print(f"✓ LangFuse observability enabled (SDK v3)")
             print(f"  Host: {_host}")
             print(f"  Public Key: {_public_key[:20]}...")
         except ImportError as e:
@@ -70,12 +117,46 @@ if os.environ.get("MONITORING_TOOL") == "langfuse":
     else:
         print("⚠ LangFuse keys not configured - running without observability")
 
+# ===================
+# LangChain Agent Setup
+# ===================
+LANGCHAIN_ENABLED = False
+langchain_agent = None
+langfuse_callback_handler = None
+LangfuseCallbackHandler = None  # Will be set if langfuse.langchain is available
+
+try:
+    from langchain_openai import ChatOpenAI
+    from langchain.tools import tool
+    from langchain.agents import create_agent
+
+    # LangFuse callback for LangChain (SDK v3)
+    # Note: We create callback handlers per-request to link to the trace context
+    if OBSERVABILITY_ENABLED:
+        try:
+            from langfuse.langchain import CallbackHandler as _LangfuseCallbackHandler
+            LangfuseCallbackHandler = _LangfuseCallbackHandler
+            langfuse_callback_handler = True  # Flag to indicate callback is available
+            print("✓ LangFuse callback handler for LangChain available (SDK v3)")
+        except ImportError as e:
+            print(f"⚠ LangFuse callback handler not available for LangChain: {e}")
+
+    LANGCHAIN_ENABLED = True
+    print("✓ LangChain agent framework loaded")
+except ImportError as e:
+    print(f"⚠ LangChain not available: {e}")
+
 # Configuration
 UPLOAD_DIR = Path("/app/uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 
 # Global state for tracking processing
 processing_status = {"status": "idle", "message": ""}
+
+# Store the main event loop for cross-thread async calls
+# This is needed because LangChain tools run in thread pool executors
+# but need to call async Cognee/Neo4j functions bound to the main loop
+_main_event_loop = None
 
 
 class QueryRequest(BaseModel):
@@ -89,9 +170,30 @@ class AddTextRequest(BaseModel):
     dataset_name: str = "default"
 
 
+class AgentQueryRequest(BaseModel):
+    """Request model for agent-based queries."""
+    query: str = Field(..., description="The user's question or request")
+    use_agent: bool = Field(default=True, description="Whether to use the LangChain agent")
+    verbose: bool = Field(default=False, description="Enable verbose agent output")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize Cognee on startup."""
+    global _main_event_loop
+
+    # Capture the main event loop for cross-thread async calls
+    _main_event_loop = asyncio.get_running_loop()
+    print("✓ Main event loop captured for cross-thread async calls")
+
+    # Initialize Cognee database (creates tables if they don't exist)
+    try:
+        from cognee.infrastructure.databases.relational import create_db_and_tables
+        await create_db_and_tables()
+        print("✓ Cognee database initialized")
+    except Exception as e:
+        print(f"⚠ Cognee setup warning (may already be initialized): {e}")
+
     # NOTE: Prune calls commented out to preserve data across restarts
     # Uncomment if you want to reset the knowledge base on each startup
     # try:
@@ -180,7 +282,7 @@ async def upload_document(
     }
 
 
-@observe(name="process_documents", as_type="workflow")
+@observe(name="process_documents", as_type="chain")
 async def process_documents(file_paths: list[str], dataset_name: str):
     """Process multiple documents with Cognee. Traced by LangFuse."""
     global processing_status
@@ -203,7 +305,7 @@ async def process_documents(file_paths: list[str], dataset_name: str):
         processing_status = {"status": "error", "message": str(e)}
     finally:
         # Flush traces to ensure they're sent to LangFuse
-        langfuse_flush()
+        langfuse_client.flush()
 
 
 async def process_document(file_path: str, dataset_name: str):
@@ -222,7 +324,7 @@ async def add_text(request: AddTextRequest, background_tasks: BackgroundTasks):
     return {"message": "Text added for processing", "status": "processing"}
 
 
-@observe(name="process_text", as_type="workflow")
+@observe(name="process_text", as_type="chain")
 async def process_text(text: str, dataset_name: str):
     """Process text with Cognee. Traced by LangFuse."""
     global processing_status
@@ -238,7 +340,7 @@ async def process_text(text: str, dataset_name: str):
         processing_status = {"status": "error", "message": str(e)}
     finally:
         # Flush traces to ensure they're sent to LangFuse
-        langfuse_flush()
+        langfuse_client.flush()
 
 
 # Helper function to extract text from various object types
@@ -391,8 +493,8 @@ async def retrieve_context(query: str, query_type, top_k: int):
         # Parse the context to extract nodes and relationships
         graph_context = parse_graph_context(context_results)
 
-        # Update the current observation with retrieval details
-        langfuse_ctx.update_current_observation(
+        # Update the current span with retrieval details (SDK v3 uses update_current_span)
+        langfuse_client.update_current_span(
             input={"query": query, "top_k": top_k, "search_type": str(query_type)},
             output={
                 "nodes": graph_context["nodes"],
@@ -406,7 +508,7 @@ async def retrieve_context(query: str, query_type, top_k: int):
             }
         )
     except Exception as e:
-        langfuse_ctx.update_current_observation(
+        langfuse_client.update_current_span(
             input={"query": query, "top_k": top_k},
             output={"error": str(e)},
             level="WARNING"
@@ -448,8 +550,8 @@ async def generate_answer(query: str, query_type, top_k: int, graph_context: dic
         for conn in graph_context.get("connections", [])[:5]:
             context_preview.append(f"{conn['source']} --[{conn['relationship']}]--> {conn['target']}")
 
-        # Update generation with details
-        langfuse_ctx.update_current_observation(
+        # Update generation with details (SDK v3 uses update_current_generation)
+        langfuse_client.update_current_generation(
             input={
                 "query": query,
                 "context_nodes": len(graph_context.get("nodes", [])),
@@ -468,7 +570,7 @@ async def generate_answer(query: str, query_type, top_k: int, graph_context: dic
         return answer
 
     except Exception as e:
-        langfuse_ctx.update_current_observation(
+        langfuse_client.update_current_span(
             input={"query": query},
             output={"error": str(e)},
             level="ERROR"
@@ -496,7 +598,7 @@ async def query_knowledge(request: QueryRequest):
         query_type = search_type_map.get(request.search_type, SearchType.GRAPH_COMPLETION)
 
         # Update the main trace with input
-        langfuse_ctx.update_current_trace(
+        langfuse_client.update_current_trace(
             input={
                 "query": request.query,
                 "search_type": request.search_type,
@@ -542,7 +644,7 @@ async def query_knowledge(request: QueryRequest):
         }
 
         # Update trace with final output
-        langfuse_ctx.update_current_trace(
+        langfuse_client.update_current_trace(
             output={
                 "answer": answer,
                 "nodes_retrieved": len(graph_context.get("nodes", [])),
@@ -551,7 +653,7 @@ async def query_knowledge(request: QueryRequest):
         )
 
         # Flush traces before returning
-        langfuse_flush()
+        langfuse_client.flush()
         return response
 
     except Exception as e:
@@ -559,13 +661,13 @@ async def query_knowledge(request: QueryRequest):
         error_detail = f"{str(e)}\n{traceback.format_exc()}"
 
         # Update trace with error
-        langfuse_ctx.update_current_trace(
+        langfuse_client.update_current_trace(
             output={"error": str(e)},
             metadata={"traceback": traceback.format_exc()[:1000]}
         )
 
         # Flush traces even on error
-        langfuse_flush()
+        langfuse_client.flush()
         raise HTTPException(status_code=500, detail=error_detail)
 
 
@@ -674,24 +776,150 @@ async def get_graph(show_all: bool = False):
 
 @app.delete("/reset")
 async def reset_knowledge_base():
-    """Reset the entire knowledge base."""
+    """Reset the entire knowledge base with comprehensive cleanup.
+
+    Clears:
+    1. Neo4j knowledge graph (all nodes and relationships)
+    2. Uploaded files
+    3. Cognee internal data and caches
+
+    Returns step-by-step progress for frontend display.
+    """
     global processing_status
 
+    steps = []
+    errors = []
+
+    # Step 1: Clear Neo4j graph
+    try:
+        from neo4j import AsyncGraphDatabase
+
+        uri = os.environ.get("GRAPH_DATABASE_URL", "bolt://neo4j:7687")
+        user = os.environ.get("GRAPH_DATABASE_USERNAME", "neo4j")
+        password = os.environ.get("GRAPH_DATABASE_PASSWORD", "cogneepassword")
+
+        driver = AsyncGraphDatabase.driver(uri, auth=(user, password))
+        async with driver.session() as session:
+            await session.run("MATCH (n) DETACH DELETE n")
+        await driver.close()
+
+        steps.append({"step": "neo4j", "status": "success", "message": "Neo4j graph cleared"})
+    except Exception as e:
+        steps.append({"step": "neo4j", "status": "error", "message": str(e)})
+        errors.append(f"Neo4j: {str(e)}")
+
+    # Step 2: Clear uploaded files
+    try:
+        cleared_files = 0
+        for file in UPLOAD_DIR.iterdir():
+            if file.is_file() and not file.name.startswith('.'):
+                file.unlink()
+                cleared_files += 1
+
+        steps.append({"step": "uploads", "status": "success", "message": f"Cleared {cleared_files} uploaded file(s)"})
+    except Exception as e:
+        steps.append({"step": "uploads", "status": "error", "message": str(e)})
+        errors.append(f"Uploads: {str(e)}")
+
+    # Step 3: Clear Cognee data
     try:
         await cognee.prune.prune_data()
         await cognee.prune.prune_system(metadata=True)
 
-        # Clear uploads
-        for file in UPLOAD_DIR.iterdir():
-            if file.is_file():
-                file.unlink()
-
-        processing_status = {"status": "idle", "message": ""}
-
-        return {"message": "Knowledge base reset successfully"}
-
+        steps.append({"step": "cognee", "status": "success", "message": "Cognee data cleared"})
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        steps.append({"step": "cognee", "status": "error", "message": str(e)})
+        errors.append(f"Cognee: {str(e)}")
+
+    # Reset processing status
+    processing_status = {"status": "idle", "message": ""}
+
+    # Return detailed response
+    success = len(errors) == 0
+    return {
+        "success": success,
+        "message": "Knowledge base reset successfully" if success else f"Reset completed with errors: {'; '.join(errors)}",
+        "steps": steps
+    }
+
+
+@app.delete("/reset-langfuse-traces")
+async def reset_langfuse_traces():
+    """Clear all LangFuse traces while preserving project, users, and API keys.
+
+    Clears ClickHouse tables:
+    - traces
+    - observations
+    - scores
+    - analytics_traces
+    - analytics_observations
+    - analytics_scores
+    - event_log
+
+    Returns step-by-step progress for frontend display.
+    """
+    import httpx
+
+    steps = []
+    errors = []
+
+    # ClickHouse connection details (from docker-compose)
+    clickhouse_url = "http://langfuse-clickhouse:8123"
+    clickhouse_user = "clickhouse"
+    clickhouse_password = "clickhousepassword"
+
+    # Tables to truncate (only actual tables, not views)
+    # Note: analytics_* are views derived from main tables and can't be truncated
+    tables = [
+        "traces",
+        "observations",
+        "scores",
+        "event_log"
+    ]
+
+    async with httpx.AsyncClient() as client:
+        for table in tables:
+            try:
+                response = await client.post(
+                    clickhouse_url,
+                    params={
+                        "user": clickhouse_user,
+                        "password": clickhouse_password,
+                        "query": f"TRUNCATE TABLE IF EXISTS {table}"
+                    },
+                    timeout=30.0
+                )
+
+                if response.status_code == 200:
+                    steps.append({
+                        "step": table,
+                        "status": "success",
+                        "message": f"Cleared {table}"
+                    })
+                else:
+                    error_msg = response.text[:200] if response.text else f"HTTP {response.status_code}"
+                    steps.append({
+                        "step": table,
+                        "status": "error",
+                        "message": error_msg
+                    })
+                    errors.append(f"{table}: {error_msg}")
+
+            except Exception as e:
+                steps.append({
+                    "step": table,
+                    "status": "error",
+                    "message": str(e)
+                })
+                errors.append(f"{table}: {str(e)}")
+
+    success = len(errors) == 0
+    return {
+        "success": success,
+        "message": "LangFuse traces cleared successfully" if success else f"Completed with errors: {'; '.join(errors)}",
+        "steps": steps,
+        "note": "Project, users, and API keys are preserved. Refresh LangFuse UI to see changes."
+    }
 
 
 @app.get("/datasets")
@@ -723,6 +951,325 @@ async def list_documents():
         return {"documents": documents, "count": len(documents)}
     except Exception as e:
         return {"documents": [], "count": 0, "error": str(e)}
+
+
+# ===================
+# LangChain Agent Tools and Endpoints
+# ===================
+
+if LANGCHAIN_ENABLED:
+    @tool
+    def search_knowledge_graph(query: str) -> str:
+        """
+        Search the knowledge graph for information about entities, relationships, and facts.
+        Use this tool when the user asks questions about people, organizations, concepts,
+        or relationships stored in the knowledge base.
+
+        Args:
+            query: The search query to find relevant information in the knowledge graph.
+
+        Returns:
+            A string containing relevant nodes and their relationships from the knowledge graph.
+        """
+        import asyncio
+        from cognee import SearchType
+
+        try:
+            # Schedule the coroutine on the main event loop from this thread
+            # This avoids "attached to a different loop" errors with Neo4j
+            if _main_event_loop is None:
+                return "Error: Main event loop not initialized"
+
+            future = asyncio.run_coroutine_threadsafe(
+                _async_search_knowledge(query),
+                _main_event_loop
+            )
+            # Wait for the result with a timeout
+            result = future.result(timeout=60)
+            return result
+        except Exception as e:
+            return f"Error searching knowledge graph: {str(e)}"
+
+    async def _async_search_knowledge(query: str) -> str:
+        """Async helper for knowledge graph search."""
+        from cognee import SearchType
+
+        try:
+            # Get context from knowledge graph
+            context_results = await cognee.search(
+                query_text=query,
+                query_type=SearchType.GRAPH_COMPLETION,
+                top_k=10,
+                only_context=True
+            )
+
+            if not context_results:
+                return "No relevant information found in the knowledge graph."
+
+            # Parse the context
+            graph_context = parse_graph_context(context_results)
+
+            # Format the response
+            response_parts = []
+
+            if graph_context["nodes"]:
+                response_parts.append("**Relevant Entities:**")
+                for node in graph_context["nodes"][:10]:
+                    response_parts.append(f"- {node['name']}: {node['content'][:200]}")
+
+            if graph_context["connections"]:
+                response_parts.append("\n**Relationships:**")
+                for conn in graph_context["connections"][:10]:
+                    response_parts.append(f"- {conn['source']} --[{conn['relationship']}]--> {conn['target']}")
+
+            if not response_parts:
+                return "No structured information found. The knowledge graph may be empty."
+
+            return "\n".join(response_parts)
+
+        except Exception as e:
+            return f"Error during search: {str(e)}"
+
+    @tool
+    def get_answer_from_knowledge(question: str) -> str:
+        """
+        Get a direct answer to a question using the knowledge graph and LLM.
+        Use this tool when you need a comprehensive answer that synthesizes
+        information from multiple sources in the knowledge base.
+
+        Args:
+            question: The question to answer using the knowledge graph.
+
+        Returns:
+            A synthesized answer based on the knowledge graph content.
+        """
+        import asyncio
+
+        try:
+            # Schedule the coroutine on the main event loop from this thread
+            # This avoids "attached to a different loop" errors with Neo4j
+            if _main_event_loop is None:
+                return "Error: Main event loop not initialized"
+
+            future = asyncio.run_coroutine_threadsafe(
+                _async_get_answer(question),
+                _main_event_loop
+            )
+            # Wait for the result with a timeout
+            result = future.result(timeout=60)
+            return result
+        except Exception as e:
+            return f"Error getting answer: {str(e)}"
+
+    async def _async_get_answer(question: str) -> str:
+        """Async helper for getting answers."""
+        from cognee import SearchType
+
+        try:
+            results = await cognee.search(
+                query_text=question,
+                query_type=SearchType.GRAPH_COMPLETION,
+                top_k=10
+            )
+
+            if results:
+                if isinstance(results[0], str):
+                    return results[0]
+                elif hasattr(results[0], 'dict'):
+                    r = results[0].dict()
+                    return r.get('text') or r.get('content') or str(r)
+                else:
+                    return str(results[0])
+            else:
+                return "I couldn't find relevant information in the knowledge base to answer this question."
+
+        except Exception as e:
+            return f"Error generating answer: {str(e)}"
+
+    @tool
+    def list_available_documents() -> str:
+        """
+        List all documents that have been uploaded to the knowledge base.
+        Use this tool when the user wants to know what information sources are available.
+
+        Returns:
+            A list of uploaded document names and their sizes.
+        """
+        try:
+            documents = []
+            for file in UPLOAD_DIR.iterdir():
+                if file.is_file() and not file.name.startswith('.'):
+                    stat = file.stat()
+                    size_kb = stat.st_size / 1024
+                    documents.append(f"- {file.name} ({size_kb:.1f} KB)")
+
+            if documents:
+                return "**Available Documents:**\n" + "\n".join(documents)
+            else:
+                return "No documents have been uploaded to the knowledge base yet."
+        except Exception as e:
+            return f"Error listing documents: {str(e)}"
+
+    def create_knowledge_agent():
+        """Create a LangChain agent for knowledge graph queries."""
+        if not LANGCHAIN_ENABLED:
+            return None
+
+        try:
+            # Initialize the LLM model name
+            llm_model = os.environ.get("LLM_MODEL", "gpt-4o-mini")
+
+            # Define the tools
+            tools = [search_knowledge_graph, get_answer_from_knowledge, list_available_documents]
+
+            # Create the agent using the new LangChain 1.x API
+            agent = create_agent(
+                model=llm_model,
+                tools=tools,
+                system_prompt="""You are a helpful knowledge assistant with access to a knowledge graph database.
+Your role is to help users find information and answer questions based on the stored knowledge.
+
+When answering questions:
+1. First use the search_knowledge_graph tool to find relevant entities and relationships
+2. If you need a synthesized answer, use get_answer_from_knowledge tool
+3. Always cite the sources (entities/relationships) you found
+4. If no relevant information is found, clearly state that
+
+Be concise but thorough in your responses."""
+            )
+
+            return agent
+
+        except Exception as e:
+            print(f"⚠ Error creating knowledge agent: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
+    # Create the agent on startup
+    knowledge_agent = create_knowledge_agent()
+    if knowledge_agent:
+        print("✓ LangChain knowledge agent initialized")
+
+    @app.post("/agent/query")
+    @observe(name="agent_query", as_type="agent")
+    async def agent_query(request: AgentQueryRequest):
+        """
+        Query the knowledge base using the LangChain agent.
+        The agent can search, reason, and synthesize information from the knowledge graph.
+        """
+        if not LANGCHAIN_ENABLED or not knowledge_agent:
+            raise HTTPException(
+                status_code=503,
+                detail="LangChain agent is not available. Check if LangChain is installed."
+            )
+
+        try:
+            # Create a new callback handler linked to the current trace context
+            callbacks = []
+            if OBSERVABILITY_ENABLED and LangfuseCallbackHandler:
+                try:
+                    # Get trace context from langfuse SDK v3 client
+                    trace_id = langfuse_client.get_current_trace_id()
+                    observation_id = langfuse_client.get_current_observation_id()
+
+                    if trace_id:
+                        # Create trace context to link LangChain operations
+                        trace_context = {"trace_id": trace_id}
+                        if observation_id:
+                            trace_context["parent_span_id"] = observation_id
+
+                        # Create callback handler with trace context
+                        handler = LangfuseCallbackHandler(
+                            trace_context=trace_context,
+                            update_trace=True
+                        )
+                        callbacks.append(handler)
+                        print(f"✓ LangChain callback linked to trace: {trace_id[:8]}...")
+                    else:
+                        # No active trace, create standalone callback
+                        handler = LangfuseCallbackHandler()
+                        callbacks.append(handler)
+                        print("⚠ No active trace, using standalone callback")
+                except Exception as e:
+                    # Fall back to standalone callback handler
+                    handler = LangfuseCallbackHandler()
+                    callbacks.append(handler)
+                    print(f"⚠ Using standalone LangChain callback: {e}")
+
+            # Update trace with input
+            langfuse_client.update_current_trace(
+                input={"query": request.query},
+                metadata={"endpoint": "/agent/query", "use_agent": request.use_agent}
+            )
+
+            # Run the agent using the new LangChain 1.x API
+            result = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: knowledge_agent.invoke(
+                    {"messages": [{"role": "user", "content": request.query}]},
+                    config={"callbacks": callbacks} if callbacks else {}
+                )
+            )
+
+            # Extract the response from messages
+            messages = result.get("messages", [])
+            answer = "No response generated"
+            steps = []
+
+            for msg in messages:
+                # Get the final assistant message as the answer
+                if hasattr(msg, 'content') and hasattr(msg, 'type'):
+                    if msg.type == "ai" and msg.content:
+                        answer = msg.content
+                    elif msg.type == "tool":
+                        steps.append({
+                            "tool": getattr(msg, 'name', 'unknown'),
+                            "input": "",
+                            "output": str(msg.content)[:500]
+                        })
+                elif isinstance(msg, dict):
+                    if msg.get("role") == "assistant" and msg.get("content"):
+                        answer = msg["content"]
+
+            response = {
+                "query": request.query,
+                "answer": answer,
+                "agent_used": True,
+                "steps": steps,
+                "tools_called": len(steps)
+            }
+
+            # Update trace with output
+            langfuse_client.update_current_trace(
+                output={
+                    "answer": answer,
+                    "tools_called": len(steps)
+                }
+            )
+
+            langfuse_client.flush()
+            return response
+
+        except Exception as e:
+            import traceback
+            langfuse_client.update_current_trace(
+                output={"error": str(e)},
+                metadata={"traceback": traceback.format_exc()[:1000]}
+            )
+            langfuse_client.flush()
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.get("/agent/status")
+    async def agent_status():
+        """Check if the LangChain agent is available and its configuration."""
+        return {
+            "langchain_enabled": LANGCHAIN_ENABLED,
+            "agent_available": knowledge_agent is not None,
+            "langfuse_callback": langfuse_callback_handler is not None,
+            "llm_model": os.environ.get("LLM_MODEL", "gpt-4o-mini"),
+            "tools": ["search_knowledge_graph", "get_answer_from_knowledge", "list_available_documents"]
+        }
 
 
 if __name__ == "__main__":

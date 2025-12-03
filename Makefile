@@ -1,4 +1,4 @@
-.PHONY: help build up down restart logs clean setup dev-backend dev-frontend test status neo4j-shell start wipe langfuse langfuse-logs langfuse-setup
+.PHONY: help build up down restart logs clean setup dev-backend dev-frontend test status neo4j-shell start wipe langfuse langfuse-logs langfuse-setup langfuse-clear-traces clear-knowledge
 
 # Default target
 help:
@@ -21,9 +21,10 @@ help:
 	@echo "  make status         - Show status of all services"
 	@echo ""
 	@echo "LangFuse Observability (Self-Hosted):"
-	@echo "  make langfuse       - Open LangFuse UI (http://localhost:3000)"
-	@echo "  make langfuse-logs  - View LangFuse service logs"
-	@echo "  make langfuse-setup - Instructions for configuring LangFuse API keys"
+	@echo "  make langfuse              - Open LangFuse UI (http://localhost:3000)"
+	@echo "  make langfuse-logs         - View LangFuse service logs"
+	@echo "  make langfuse-setup        - Instructions for configuring LangFuse API keys"
+	@echo "  make langfuse-clear-traces - Clear all traces (keeps project/keys)"
 	@echo ""
 	@echo "Development:"
 	@echo "  make dev-backend    - Run backend locally (without Docker)"
@@ -34,8 +35,9 @@ help:
 	@echo "  make neo4j-shell    - Open Neo4j browser (http://localhost:7475)"
 	@echo ""
 	@echo "Cleanup:"
-	@echo "  make clean          - Remove all containers and volumes"
-	@echo "  make wipe           - Delete ALL data and restart fresh"
+	@echo "  make clear-knowledge - Clear knowledge graph & docs (keeps services running)"
+	@echo "  make clean           - Remove all containers and volumes"
+	@echo "  make wipe            - Delete ALL data and restart fresh"
 	@echo ""
 
 # Setup environment file
@@ -141,6 +143,74 @@ langfuse-setup:
 	@echo "  7. Restart the backend:"
 	@echo "     make restart"
 	@echo ""
+	@echo "============================================"
+
+# Clear knowledge graph and documents (keeps services running)
+clear-knowledge:
+	@echo "Clearing knowledge graph and documents..."
+	@echo ""
+	@# Clear Neo4j database (all nodes and relationships)
+	@echo "  Clearing Neo4j graph..."
+	@docker exec cognee-neo4j cypher-shell -u neo4j -p cogneepassword \
+		"MATCH (n) DETACH DELETE n" 2>/dev/null || \
+		echo "    (Neo4j may need a moment to start)"
+	@# Clear uploaded files
+	@echo "  Clearing uploaded files..."
+	@rm -rf uploads/* 2>/dev/null || true
+	@touch uploads/.gitkeep
+	@# Reset Cognee via API (clears internal caches and data)
+	@echo "  Resetting Cognee data..."
+	@curl -s -X DELETE http://localhost:8000/reset > /dev/null 2>&1 || true
+	@echo ""
+	@echo "============================================"
+	@echo "  Knowledge base cleared!"
+	@echo "============================================"
+	@echo ""
+	@echo "  - Neo4j graph: cleared"
+	@echo "  - Uploaded documents: cleared"
+	@echo "  - Cognee data: cleared"
+	@echo ""
+	@echo "  Services are still running."
+	@echo "  Ready to upload new documents."
+	@echo "============================================"
+
+# Clear LangFuse traces (keeps project, users, API keys)
+langfuse-clear-traces:
+	@echo "Clearing LangFuse traces..."
+	@echo ""
+	@# Clear ClickHouse trace tables
+	@docker exec langfuse-clickhouse clickhouse-client \
+		--user clickhouse --password clickhousepassword \
+		-q "TRUNCATE TABLE traces" 2>/dev/null || true
+	@docker exec langfuse-clickhouse clickhouse-client \
+		--user clickhouse --password clickhousepassword \
+		-q "TRUNCATE TABLE observations" 2>/dev/null || true
+	@docker exec langfuse-clickhouse clickhouse-client \
+		--user clickhouse --password clickhousepassword \
+		-q "TRUNCATE TABLE scores" 2>/dev/null || true
+	@docker exec langfuse-clickhouse clickhouse-client \
+		--user clickhouse --password clickhousepassword \
+		-q "TRUNCATE TABLE analytics_traces" 2>/dev/null || true
+	@docker exec langfuse-clickhouse clickhouse-client \
+		--user clickhouse --password clickhousepassword \
+		-q "TRUNCATE TABLE analytics_observations" 2>/dev/null || true
+	@docker exec langfuse-clickhouse clickhouse-client \
+		--user clickhouse --password clickhousepassword \
+		-q "TRUNCATE TABLE analytics_scores" 2>/dev/null || true
+	@docker exec langfuse-clickhouse clickhouse-client \
+		--user clickhouse --password clickhousepassword \
+		-q "TRUNCATE TABLE event_log" 2>/dev/null || true
+	@echo ""
+	@echo "============================================"
+	@echo "  LangFuse traces cleared!"
+	@echo "============================================"
+	@echo ""
+	@echo "  - All traces: cleared"
+	@echo "  - All observations: cleared"
+	@echo "  - All scores: cleared"
+	@echo ""
+	@echo "  Project, users, and API keys are preserved."
+	@echo "  Refresh LangFuse UI to see changes."
 	@echo "============================================"
 
 # Local development - backend only
