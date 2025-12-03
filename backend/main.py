@@ -153,6 +153,35 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 # Global state for tracking processing
 processing_status = {"status": "idle", "message": ""}
 
+# Custom prompt for entity extraction with type classification
+# This instructs the LLM to classify entities into specific types
+ENTITY_EXTRACTION_PROMPT = """
+Extract entities and relationships from the text. For each entity, classify it into one of these types:
+
+ENTITY TYPES:
+- Person: Individual people, characters, named individuals
+- Organization: Companies, institutions, teams, groups, agencies
+- Location: Places, cities, countries, addresses, geographical features
+- Concept: Abstract ideas, theories, methodologies, principles
+- Technology: Software, hardware, tools, platforms, programming languages
+- Product: Physical or digital products, services, offerings
+- Event: Meetings, conferences, incidents, historical events
+- Document: Reports, papers, articles, books, specifications
+- Date: Specific dates, time periods, deadlines
+- Metric: Numbers, statistics, measurements, KPIs
+
+RULES:
+1. Always assign the most specific type that fits
+2. Extract relationships between entities (e.g., "works_at", "located_in", "created_by")
+3. Include descriptive attributes when available
+4. Preserve the original names exactly as they appear in the text
+
+For each entity, provide:
+- name: The entity's name
+- type: One of the types listed above
+- description: Brief description of the entity based on context
+"""
+
 # Store the main event loop for cross-thread async calls
 # This is needed because LangChain tools run in thread pool executors
 # but need to call async Cognee/Neo4j functions bound to the main loop
@@ -293,8 +322,8 @@ async def process_documents(file_paths: list[str], dataset_name: str):
             processing_status = {"status": "processing", "message": f"Adding document {i}/{total}: {Path(file_path).name}"}
             await cognee.add(file_path, dataset_name=dataset_name)
 
-        processing_status = {"status": "processing", "message": "Building knowledge graph..."}
-        await cognee.cognify()
+        processing_status = {"status": "processing", "message": "Building knowledge graph with entity classification..."}
+        await cognee.cognify(custom_prompt=ENTITY_EXTRACTION_PROMPT)
 
         processing_status = {"status": "processing", "message": "Adding memory algorithms..."}
         await cognee.memify()
@@ -331,8 +360,8 @@ async def process_text(text: str, dataset_name: str):
 
     try:
         await cognee.add(text, dataset_name=dataset_name)
-        processing_status = {"status": "processing", "message": "Building knowledge graph..."}
-        await cognee.cognify()
+        processing_status = {"status": "processing", "message": "Building knowledge graph with entity classification..."}
+        await cognee.cognify(custom_prompt=ENTITY_EXTRACTION_PROMPT)
         processing_status = {"status": "processing", "message": "Adding memory algorithms..."}
         await cognee.memify()
         processing_status = {"status": "completed", "message": "Text processed successfully"}
@@ -382,6 +411,98 @@ def parse_graph_context(raw_context):
     connections = []
     raw_text = ""
 
+    # Valid entity types for classification
+    VALID_ENTITY_TYPES = {
+        "Person", "Organization", "Location", "Concept", "Technology",
+        "Product", "Event", "Document", "Date", "Metric"
+    }
+
+    def extract_entity_type(header, content):
+        """Extract entity type from node header tags or content."""
+        # Check for tags in header like [Person] or [Organization]
+        tag_match = re.search(r'\[([^\]]+)\]', header)
+        if tag_match:
+            tag = tag_match.group(1).strip()
+            # Check if tag matches a valid entity type
+            for valid_type in VALID_ENTITY_TYPES:
+                if valid_type.lower() in tag.lower():
+                    return valid_type
+
+        # Check content for type hints (order matters - more specific checks first)
+        content_lower = content.lower() if content else ""
+        name_lower = header.lower() if header else ""
+
+        # Person detection (check first - titles and roles indicate persons)
+        person_titles = ['ceo', 'cto', 'cfo', 'founder', 'director', 'manager', 'president',
+                        'chairman', 'officer', 'executive', 'employee', 'worker', 'staff']
+        person_words = ['person', 'individual', 'human', 'man', 'woman', 'people']
+
+        # Check if description mentions someone IS/WAS a title (strong person indicator)
+        for title in person_titles:
+            if f'is {title}' in content_lower or f'the {title}' in content_lower or f'as {title}' in content_lower:
+                return 'Person'
+            # Check if description starts with title (e.g., "CEO of...")
+            if content_lower.startswith(title):
+                return 'Person'
+
+        if any(word in content_lower for word in person_words):
+            return 'Person'
+
+        # Location detection (check before Organization - cities/countries are locations)
+        location_words = ['city', 'country', 'location', 'place', 'region', 'address',
+                         'state', 'province', 'town', 'village', 'capital', 'located in']
+        if any(word in content_lower for word in location_words):
+            return 'Location'
+
+        # Common city/country names in the entity name itself
+        known_locations = ['francisco', 'york', 'angeles', 'london', 'paris', 'tokyo',
+                          'berlin', 'chicago', 'boston', 'seattle', 'amsterdam']
+        if any(loc in name_lower for loc in known_locations):
+            return 'Location'
+
+        # Organization detection
+        org_words = ['company', 'organization', 'corporation', 'team', 'agency',
+                    'institution', 'firm', 'enterprise', 'business', 'inc', 'llc', 'ltd']
+        if any(word in content_lower for word in org_words):
+            return 'Organization'
+
+        # Technology detection
+        tech_words = ['software', 'tool', 'platform', 'framework', 'language', 'api',
+                     'system', 'application', 'app', 'technology', 'tech']
+        if any(word in content_lower for word in tech_words):
+            return 'Technology'
+
+        # Product detection
+        product_words = ['product', 'service', 'offering', 'solution', 'feature']
+        if any(word in content_lower for word in product_words):
+            return 'Product'
+
+        # Event detection
+        event_words = ['event', 'meeting', 'conference', 'summit', 'workshop',
+                      'seminar', 'webinar', 'incident', 'ceremony']
+        if any(word in content_lower for word in event_words):
+            return 'Event'
+
+        # Concept detection
+        concept_words = ['concept', 'idea', 'theory', 'methodology', 'principle',
+                        'approach', 'strategy', 'philosophy']
+        if any(word in content_lower for word in concept_words):
+            return 'Concept'
+
+        # Date/Time detection
+        date_words = ['date', 'time', 'period', 'month', 'year', 'day', 'week',
+                     'quarter', 'deadline', 'schedule']
+        if any(word in content_lower for word in date_words):
+            return 'Date'
+
+        # Metric detection
+        metric_words = ['metric', 'number', 'statistic', 'kpi', 'measurement',
+                       'percentage', 'rate', 'count', 'total', 'average']
+        if any(word in content_lower for word in metric_words):
+            return 'Metric'
+
+        return "Entity"
+
     if not raw_context:
         return {"nodes": [], "connections": [], "raw_context": ""}
 
@@ -409,11 +530,14 @@ def parse_graph_context(raw_context):
         name_match = re.match(r'^([^\[]+)', node_header)
         node_name = name_match.group(1).strip() if name_match else node_header
 
+        # Extract entity type from header tags or content
+        entity_type = extract_entity_type(node_header, node_content)
+
         # Skip nodes with None or empty content
         if node_content and node_content.lower() != 'none':
             nodes.append({
                 "name": node_name[:100],
-                "type": "Entity",
+                "type": entity_type,
                 "content": node_content[:500]
             })
 
@@ -677,6 +801,9 @@ async def get_graph(show_all: bool = False):
 
     By default, only shows Entity nodes and their relationships.
     Set show_all=true to see all node types (documents, chunks, summaries).
+
+    Entity types are extracted from the 'type' property set during cognify:
+    Person, Organization, Location, Concept, Technology, Product, Event, Document, Date, Metric
     """
     try:
         from neo4j import AsyncGraphDatabase
@@ -690,6 +817,153 @@ async def get_graph(show_all: bool = False):
         nodes = []
         edges = []
         seen_nodes = set()
+
+        # Valid entity types from our custom prompt
+        VALID_ENTITY_TYPES = {
+            "Person", "Organization", "Location", "Concept", "Technology",
+            "Product", "Event", "Document", "Date", "Metric"
+        }
+
+        def get_entity_type(node_props, labels):
+            """Extract the entity type from node properties or labels.
+
+            Priority:
+            1. 'type' property if it's a valid entity type
+            2. 'entity_type' property
+            3. Neo4j label (excluding __Node__ and Entity)
+            4. Content-based heuristics
+            5. Default to 'Entity'
+            """
+            # Check type property first (Cognee stores entity classification here)
+            node_type = node_props.get('type', '')
+            if node_type in VALID_ENTITY_TYPES:
+                return node_type
+
+            # Check entity_type property
+            entity_type = node_props.get('entity_type', '')
+            if entity_type in VALID_ENTITY_TYPES:
+                return entity_type
+
+            # Check if type property contains a valid type (case-insensitive)
+            if node_type:
+                for valid_type in VALID_ENTITY_TYPES:
+                    if valid_type.lower() in node_type.lower():
+                        return valid_type
+
+            # Fall back to Neo4j labels
+            for label in labels:
+                if label not in ("__Node__", "Entity") and label in VALID_ENTITY_TYPES:
+                    return label
+
+            # Check labels for partial matches
+            for label in labels:
+                if label not in ("__Node__", "Entity"):
+                    for valid_type in VALID_ENTITY_TYPES:
+                        if valid_type.lower() in label.lower():
+                            return valid_type
+
+            # Content-based heuristics (order matters - check specific types first)
+            name = str(node_props.get('name', '')).lower()
+            description = str(node_props.get('description', '')).lower()
+
+            # Metric detection (check first - numbers, ages, attendance)
+            metric_patterns = ['attendance', 'number', 'count', 'total', 'approximate', 'percentage',
+                              'over ', 'about ', 'around ', 'approximately']
+            if any(word in description for word in metric_patterns):
+                return 'Metric'
+            # Age values
+            if 'years old' in name or 'age value' in description:
+                return 'Metric'
+            # Pattern: "over X people", "500 people", etc.
+            if 'people' in name or 'people' in description.split('.')[0]:
+                return 'Metric'
+
+            # Person detection (check early - titles indicate persons)
+            person_titles = ['ceo', 'cto', 'cfo', 'founder', 'director', 'manager', 'president',
+                            'chairman', 'officer', 'executive', 'employee', 'coworker', 'worker']
+            for title in person_titles:
+                if f'is {title}' in description or f'the {title}' in description or description.startswith(title):
+                    return 'Person'
+            # Person patterns: age + working/relationship
+            if 'years old' in description and any(word in description for word in ['working', 'works', 'worked', 'relationship', 'coworker', 'interested']):
+                return 'Person'
+            if any(word in description for word in ['person', 'individual', 'human']):
+                return 'Person'
+
+            # Date detection (specific patterns - NOT matching "years old")
+            date_patterns = ['time period', 'period when', 'last month', 'next month', 'this year',
+                            'last year', 'next year', 'deadline', 'scheduled for']
+            if any(pattern in description for pattern in date_patterns):
+                return 'Date'
+            if name in ['last month', 'this month', 'next month', 'last year', 'this year', 'next year']:
+                return 'Date'
+
+            # Location detection
+            location_words = ['city', 'country', 'location', 'place', 'region', 'address', 'state', 'capital', 'base location']
+            if any(word in description for word in location_words):
+                return 'Location'
+            # Known location names
+            known_locations = ['francisco', 'york', 'angeles', 'london', 'paris', 'tokyo', 'berlin', 'chicago', 'boston']
+            if any(loc in name for loc in known_locations):
+                return 'Location'
+
+            # Product detection (check BEFORE Event - products may mention launch events)
+            # Name-based product detection (high priority)
+            if any(word in name for word in ['assist', 'app', 'tool', 'software', 'platform', 'product']):
+                return 'Product'
+            if description.startswith('product') or description.startswith('new product') or description.startswith('a product'):
+                return 'Product'
+
+            # Event detection (check BEFORE Organization - many events mention organizations)
+            event_words = ['conference', 'event', 'meeting', 'summit', 'workshop', 'seminar']
+            # Only match Event if the NAME suggests it's an event, or it's clearly about the event itself
+            if any(word in name for word in ['conference', 'summit', 'event', 'meeting', 'annual']):
+                return 'Event'
+            # Match if description is ABOUT an event (not just mentioning one)
+            if any(word in description[:30] for word in event_words):
+                return 'Event'
+            # Pattern: "new X announced by", "X developed by", "X created by"
+            if any(pattern in description for pattern in ['announced by', 'developed by', 'created by', 'made by', 'built by']):
+                return 'Product'
+            # "New product announced" pattern
+            if 'new product' in description or 'announced' in description[:50]:
+                return 'Product'
+            # "X products developed by" - the entity IS a product type
+            if 'products' in name or (description.startswith(name) and 'products' in description[:len(name)+15]):
+                return 'Product'
+
+            # Organization detection - entity IS the org (not just mentions one)
+            # Check if description says THIS entity is a company/org
+            org_patterns = [
+                'is a company', 'is an organization', 'is a corporation', 'is a firm',
+                'a company', 'technology company', 'software company', 'is a team'
+            ]
+            if description.startswith(('a ', 'an ', 'the ')) and any(word in description[:50] for word in ['company', 'organization', 'corporation', 'firm', 'enterprise']):
+                return 'Organization'
+            if any(pattern in description for pattern in org_patterns):
+                return 'Organization'
+            # Name ends with common org suffixes
+            if any(name.endswith(suffix) for suffix in [' inc', ' corp', ' corporation', ' llc', ' ltd', ' company']):
+                return 'Organization'
+            # Fallback: only match if "company" etc appears at the START of description
+            org_words = ['company', 'organization', 'corporation', 'firm', 'enterprise']
+            first_sentence = description.split('.')[0] if '.' in description else description
+            if any(f' is a {word}' in first_sentence or first_sentence.startswith(word) for word in org_words):
+                return 'Organization'
+
+            # Technology detection
+            tech_words = ['artificial intelligence', 'machine learning', 'programming language',
+                         'framework', 'api', 'protocol']
+            if any(word in description for word in tech_words):
+                return 'Technology'
+            if name in ['ai', 'ml', 'python', 'javascript', 'java', 'react', 'api']:
+                return 'Technology'
+            # AI as area of interest
+            if 'area of interest' in description or 'interested in' in description:
+                if 'ai' in description or 'artificial intelligence' in description:
+                    return 'Technology'
+
+            return "Entity"
 
         async with driver.session() as session:
             if show_all:
@@ -724,8 +998,8 @@ async def get_graph(show_all: bool = False):
                     if node_id not in seen_nodes:
                         seen_nodes.add(node_id)
                         node_label = n.get('name') or n.get('text') or n.get('title') or node_id[:30]
-                        # Get the most specific label (not __Node__)
-                        node_type = next((l for l in n_labels if l != "__Node__"), "Entity")
+                        # Get entity type from properties or labels
+                        node_type = get_entity_type(dict(n), n_labels)
                         nodes.append({
                             "id": node_id,
                             "label": str(node_label)[:50],
@@ -738,7 +1012,7 @@ async def get_graph(show_all: bool = False):
                     if node_id not in seen_nodes:
                         seen_nodes.add(node_id)
                         node_label = m.get('name') or m.get('text') or m.get('title') or node_id[:30]
-                        node_type = next((l for l in m_labels if l != "__Node__"), "Entity")
+                        node_type = get_entity_type(dict(m), m_labels)
                         nodes.append({
                             "id": node_id,
                             "label": str(node_label)[:50],

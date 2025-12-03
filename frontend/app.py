@@ -656,16 +656,23 @@ with tab2:
             nodes = []
             edges = []
 
-            # Color mapping for node types
+            # Color mapping for node types (matching backend entity classification)
             type_colors = {
-                "Entity": "#4CAF50",
-                "Document": "#2196F3",
-                "Chunk": "#FF9800",
-                "Concept": "#9C27B0",
-                "Person": "#E91E63",
-                "Organization": "#00BCD4",
-                "Location": "#795548",
-                "default": "#607D8B"
+                # Entity types from custom extraction prompt
+                "Person": "#E91E63",           # Pink - People
+                "Organization": "#00BCD4",     # Cyan - Companies, institutions
+                "Location": "#795548",         # Brown - Places
+                "Concept": "#9C27B0",          # Purple - Abstract ideas
+                "Technology": "#3F51B5",       # Indigo - Software, tools
+                "Product": "#FF5722",          # Deep Orange - Products
+                "Event": "#FFC107",            # Amber - Events
+                "Document": "#2196F3",         # Blue - Documents
+                "Date": "#009688",             # Teal - Dates
+                "Metric": "#8BC34A",           # Light Green - Numbers, KPIs
+                # Default and legacy types
+                "Entity": "#4CAF50",           # Green - Generic entity
+                "Chunk": "#FF9800",            # Orange - Text chunks
+                "default": "#607D8B"           # Gray - Unknown
             }
 
             # Uniform node size for all nodes
@@ -708,15 +715,23 @@ with tab2:
             # Render graph
             return_value = agraph(nodes=nodes, edges=edges, config=config)
 
-            # Legend
+            # Legend - display in rows of 4 columns
             st.markdown("### Legend")
-            legend_cols = st.columns(len(type_colors))
-            for i, (node_type, color) in enumerate(type_colors.items()):
-                with legend_cols[i % len(legend_cols)]:
-                    st.markdown(
-                        f'<span style="color:{color}">●</span> {node_type}',
-                        unsafe_allow_html=True
-                    )
+            # Filter out 'default' from legend and only show types that might appear
+            legend_types = {k: v for k, v in type_colors.items() if k != "default"}
+            legend_items = list(legend_types.items())
+
+            # Display in rows of 4
+            cols_per_row = 4
+            for row_start in range(0, len(legend_items), cols_per_row):
+                row_items = legend_items[row_start:row_start + cols_per_row]
+                cols = st.columns(cols_per_row)
+                for i, (node_type, color) in enumerate(row_items):
+                    with cols[i]:
+                        st.markdown(
+                            f'<span style="color:{color}; font-size: 16px;">●</span> {node_type}',
+                            unsafe_allow_html=True
+                        )
 
         else:
             st.warning("No graph data available. Upload documents and process them first.")
