@@ -578,21 +578,25 @@ async def detect_gaps_from_existing():
 
 @app.post("/api/sync/update-topics")
 async def update_topic_analytics():
-    """Recalculate topic analytics from traces"""
+    """Recalculate topic analytics from traces (traces are source of truth)"""
     from datetime import datetime
     from app.models.database import async_session_maker, Trace, TopicAnalytics
-    from sqlalchemy import select, func, and_, or_
+    from sqlalchemy import select, func, and_, or_, delete
 
     try:
         async with async_session_maker() as db:
-            # Get all unique topics from traces
-            topics_query = select(Trace.topic).distinct().where(Trace.topic.isnot(None))
+            # Get all unique topics from traces (source of truth)
+            topics_query = select(Trace.topic).distinct().where(
+                and_(Trace.topic.isnot(None), Trace.topic != "Uncategorized")
+            )
             topics_result = await db.execute(topics_query)
             topics = [row[0] for row in topics_result.fetchall()]
 
-            logger.info(f"Found {len(topics)} unique topics: {topics}")
+            logger.info(f"Found {len(topics)} unique topics in traces: {topics}")
 
-            updated_count = 0
+            # Clear all existing topic analytics to ensure consistency
+            await db.execute(delete(TopicAnalytics))
+
             created_count = 0
 
             for topic in topics:
@@ -617,30 +621,16 @@ async def update_topic_analytics():
 
                 logger.info(f"Topic '{topic}': total={total}, success={success}, conf={avg_confidence}")
 
-                # Update or create analytics record
-                existing_query = select(TopicAnalytics).where(TopicAnalytics.topic == topic)
-                existing_result = await db.execute(existing_query)
-                existing = existing_result.scalar_one_or_none()
-
-                if existing:
-                    existing.question_count = total
-                    existing.success_count = success
-                    existing.failure_count = total - success
-                    existing.success_rate = (success / total * 100) if total > 0 else 0
-                    existing.avg_confidence = avg_confidence or 0
-                    existing.updated_at = datetime.utcnow()
-                    updated_count += 1
-                else:
-                    new_analytics = TopicAnalytics(
-                        topic=topic,
-                        question_count=total,
-                        success_count=success,
-                        failure_count=total - success,
-                        success_rate=(success / total * 100) if total > 0 else 0,
-                        avg_confidence=avg_confidence or 0,
-                    )
-                    db.add(new_analytics)
-                    created_count += 1
+                new_analytics = TopicAnalytics(
+                    topic=topic,
+                    question_count=total,
+                    success_count=success,
+                    failure_count=total - success,
+                    success_rate=(success / total * 100) if total > 0 else 0,
+                    avg_confidence=avg_confidence or 0,
+                )
+                db.add(new_analytics)
+                created_count += 1
 
             await db.commit()
 
@@ -648,7 +638,6 @@ async def update_topic_analytics():
                 "status": "success",
                 "topics_found": len(topics),
                 "topics_created": created_count,
-                "topics_updated": updated_count,
             }
 
     except Exception as e:
@@ -751,14 +740,22 @@ async def discover_topics():
                     trace.updated_at = datetime.utcnow()
                     traces_updated += 1
 
+            await db.commit()
+
+            # Now update topic analytics based on actual trace data (source of truth)
             # Clear existing topic analytics
             await db.execute(delete(TopicAnalytics))
 
-            # Create new topic analytics based on discovered topics
-            topic_labels = topic_modeler.get_topic_labels()
-            for topic_id, label in topic_labels.items():
-                if topic_id == -1:
-                    continue  # Skip outlier topic
+            # Get all unique topics from traces (this is the source of truth)
+            distinct_topics_query = select(Trace.topic).distinct().where(Trace.topic.isnot(None))
+            distinct_result = await db.execute(distinct_topics_query)
+            all_topics = [row[0] for row in distinct_result.fetchall()]
+
+            logger.info(f"Creating analytics for {len(all_topics)} topics from traces: {all_topics}")
+
+            for label in all_topics:
+                if label == "Uncategorized":
+                    continue  # Skip uncategorized
 
                 # Count traces with this topic
                 count_query = select(func.count(Trace.id)).where(Trace.topic == label)
