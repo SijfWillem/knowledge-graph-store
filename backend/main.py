@@ -362,8 +362,8 @@ async def process_text(text: str, dataset_name: str):
         await cognee.add(text, dataset_name=dataset_name)
         processing_status = {"status": "processing", "message": "Building knowledge graph with entity classification..."}
         await cognee.cognify(custom_prompt=ENTITY_EXTRACTION_PROMPT)
-        processing_status = {"status": "processing", "message": "Adding memory algorithms..."}
-        await cognee.memify()
+        # processing_status = {"status": "processing", "message": "Adding memory algorithms..."}
+        # await cognee.memify()
         processing_status = {"status": "completed", "message": "Text processed successfully"}
     except Exception as e:
         processing_status = {"status": "error", "message": str(e)}

@@ -12,6 +12,8 @@ services:
       POSTGRES_DB: langfuse
     volumes:
       - langfuse_postgres_data:/var/lib/postgresql/data
+    networks:
+      - cognee-network
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U langfuse -d langfuse"]
       interval: 5s
@@ -30,6 +32,8 @@ services:
     volumes:
       - langfuse_clickhouse_data:/var/lib/clickhouse
       - langfuse_clickhouse_logs:/var/log/clickhouse-server
+    networks:
+      - cognee-network
     healthcheck:
       test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1"]
       interval: 5s
@@ -44,6 +48,8 @@ services:
     command: redis-server --requirepass redispassword
     volumes:
       - langfuse_redis_data:/data
+    networks:
+      - cognee-network
     healthcheck:
       test: ["CMD", "redis-cli", "-a", "redispassword", "ping"]
       interval: 5s
@@ -61,6 +67,8 @@ services:
       MINIO_ROOT_PASSWORD: miniosecret
     volumes:
       - langfuse_minio_data:/data
+    networks:
+      - cognee-network
     healthcheck:
       test: ["CMD", "mc", "ready", "local"]
       interval: 5s
@@ -107,6 +115,8 @@ services:
       LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: miniosecret
       LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://langfuse-minio:9000
       LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+    networks:
+      - cognee-network
 
   langfuse-web:
     image: langfuse/langfuse:3
@@ -126,6 +136,8 @@ services:
     environment:
       <<: *langfuse-env
       NEXTAUTH_SECRET: ${LANGFUSE_NEXTAUTH_SECRET:-cognee-langfuse-secret-change-me}
+    networks:
+      - cognee-network
 
   # ===================
   # Cognee Stack
@@ -144,11 +156,14 @@ services:
     volumes:
       - neo4j_data:/data
       - neo4j_logs:/logs
+    networks:
+      - cognee-network
     healthcheck:
       test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:7474 || exit 1"]
       interval: 10s
       timeout: 5s
-      retries: 5
+      retries: 10
+      start_period: 60s
 
   weaviate:
     image: semitechnologies/weaviate:1.24.1
@@ -165,6 +180,8 @@ services:
       - CLUSTER_HOSTNAME=node1
     volumes:
       - weaviate_data:/var/lib/weaviate
+    networks:
+      - cognee-network
     healthcheck:
       test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8080/v1/.well-known/ready || exit 1"]
       interval: 10s
@@ -199,6 +216,8 @@ services:
       - ./backend:/app
       - ./uploads:/app/uploads
       - cognee_data:/root/.cognee_system
+    networks:
+      - cognee-network
     depends_on:
       neo4j:
         condition: service_healthy
@@ -216,8 +235,91 @@ services:
       - BACKEND_URL=http://backend:8000
     volumes:
       - ./frontend:/app
+    networks:
+      - cognee-network
     depends_on:
       - backend
+
+  # ===================
+  # Knowledge Gap Dashboard
+  # ===================
+  dashboard-postgres:
+    image: postgres:15-alpine
+    container_name: dashboard-postgres
+    restart: always
+    environment:
+      POSTGRES_USER: dashboard
+      POSTGRES_PASSWORD: dashboardpassword
+      POSTGRES_DB: knowledge_gaps
+    volumes:
+      - dashboard_postgres_data:/var/lib/postgresql/data
+    networks:
+      - cognee-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dashboard -d knowledge_gaps"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  dashboard-redis:
+    image: redis:7-alpine
+    container_name: dashboard-redis
+    restart: always
+    volumes:
+      - dashboard_redis_data:/data
+    networks:
+      - cognee-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  dashboard-backend:
+    build:
+      context: ./dashboard/backend
+      dockerfile: Dockerfile
+    container_name: dashboard-backend
+    ports:
+      - "8080:8000"
+    environment:
+      # LangFuse connection (uses the self-hosted instance)
+      - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY:-}
+      - LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY:-}
+      - LANGFUSE_HOST=http://langfuse-web:3000
+      # Cognee LLM API key
+      - COGNEE_LLM_API_KEY=${OPENAI_API_KEY}
+      # Database
+      - DATABASE_URL=postgresql+asyncpg://dashboard:dashboardpassword@dashboard-postgres:5432/knowledge_gaps
+      # Redis
+      - REDIS_URL=redis://dashboard-redis:6379/0
+    networks:
+      - cognee-network
+    depends_on:
+      dashboard-postgres:
+        condition: service_healthy
+      dashboard-redis:
+        condition: service_healthy
+      langfuse-web:
+        condition: service_started
+
+  dashboard-frontend:
+    build:
+      context: ./dashboard/frontend
+      dockerfile: Dockerfile
+    container_name: dashboard-frontend
+    ports:
+      - "3001:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8080
+    networks:
+      - cognee-network
+    depends_on:
+      - dashboard-backend
+
+networks:
+  cognee-network:
+    driver: bridge
 
 volumes:
   # LangFuse volumes
@@ -231,3 +333,6 @@ volumes:
   neo4j_logs:
   weaviate_data:
   cognee_data:
+  # Dashboard volumes
+  dashboard_postgres_data:
+  dashboard_redis_data:
